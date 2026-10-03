@@ -1,3 +1,73 @@
+<div align="center">
+  <img src="https://cdn-uploads.huggingface.co/production/uploads/61b8e2ba285851687028d395/2b08LKpev0DNEk6DlnWkY.png" alt="Liquid AI" width="100%"/>
+  <p>
+    <a href="https://huggingface.co/LiquidAI/lfm2.5-350m-diffusion-exp"><strong>Model</strong></a> •
+    <a href="https://github.com/Liquid4All/lfm-diffusion"><strong>LFM Diffusion</strong></a> •
+    <a href="https://docs.liquid.ai/lfm/getting-started/welcome"><strong>Docs</strong></a> •
+    <a href="https://discord.com/invite/liquid-ai"><strong>Discord</strong></a>
+  </p>
+</div>
+
+# SGLang for LFM2 block diffusion
+
+[SGLang](https://github.com/sgl-project/sglang) with serving support for Liquid AI's block-diffusion language
+models (`Lfm2ForBlockDiffusion`, such as [LFM2.5-350M-Diffusion](https://huggingface.co/LiquidAI/lfm2.5-350m-diffusion-exp)).
+It adds the `DuoBlock` algorithm: uniform-state denoising of 32-token blocks with fused Triton kernels, whole-block
+CUDA graphs, commit fusion and continuous batching, behind SGLang's OpenAI-compatible server. Everything else is
+upstream SGLang (`2e7c85da6`, August 2026). Model details, evaluation and citation are on the
+[LFM Diffusion](https://github.com/Liquid4All/lfm-diffusion) page.
+
+## Install
+
+```bash
+git clone https://github.com/Liquid4All/sglang-diffusion-lfm && cd sglang-diffusion-lfm
+SGLANG_BUILD_RUST_EXTS=none pip install -e "python"     # NVIDIA
+# AMD (ROCm):
+mv python/pyproject_other.toml python/pyproject.toml && SGLANG_BUILD_RUST_EXTS=none pip install -e "python[all_hip]"
+```
+
+`SGLANG_BUILD_RUST_EXTS=none` skips SGLang's optional Rust extensions, which otherwise need a Rust toolchain.
+
+## Serve
+
+```bash
+bash examples/dllm/lfm2_diffusion/serve_throughput.sh                          # batched serving, NFE 8
+DECODE=decode_nfe4.yaml bash examples/dllm/lfm2_diffusion/serve_throughput.sh  # fastest
+bash examples/dllm/lfm2_diffusion/serve_latency.sh                             # one request at a time
+```
+
+```bash
+curl http://localhost:30000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "LiquidAI/lfm2.5-350m-diffusion-exp",
+  "messages": [{"role": "user", "content": "Give three tips for getting better sleep."}],
+  "max_tokens": 256
+}'
+```
+
+Decode presets in [`examples/dllm/lfm2_diffusion`](examples/dllm/lfm2_diffusion): `decode_nfe32.yaml` (highest
+quality), `decode_nfe8.yaml` (recommended), `decode_nfe4.yaml` (fastest). A request can set
+`dllm_steps_per_block`, `temperature`, `top_p` and `top_k`; options the block sampler does not apply (penalties,
+`min_p`, `min_new_tokens`, `logit_bias`, structured output, logprobs) are refused with a 400.
+
+## Speed
+
+Decode speedup over autoregressive LFM2.5-350M at batch size 1 (1024-token prompt, 1024 new tokens):
+
+| GPU | NFE 32 | NFE 16 | NFE 8 | NFE 4 |
+|---|---|---|---|---|
+| H100 | 0.89× | 1.65× | 2.93× | 4.74× |
+| B200 | 0.75× | 1.38× | 2.47× | 4.07× |
+| MI325X | 0.78× | 1.50× | 2.81× | 4.98× |
+
+Median of 5 machines per GPU, with the autoregressive model and the diffusion model measured back to back on the
+same machine. The autoregressive baseline uses its fastest SGLang configuration (CUDA graphs and continuous decode
+steps; `SGLANG_USE_AITER=1` on MI325X). B200 and H100: 32 pinned CPU cores; MI325X: 14 cores. Autoregressive
+decoding at batch size 1 is bound by the host CPU, so on slower CPUs the speedup is larger.
+
+---
+
+*The upstream SGLang README follows.*
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 

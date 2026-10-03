@@ -24,7 +24,9 @@ The decode config sets the server defaults; a request overrides them where it se
 
 A value equal to SGLang's default (`temperature` 1.0, `top_p` 1.0, `top_k` -1) counts as unset. Requests with different
 settings are scheduled in different rounds, and a setting other than the config's captures its own block graph on first
-use (startup warmup covers the config's settings only). `seed` is ignored (logged once); `return_logprob` is refused.
+use (startup warmup covers the config's settings only). `seed` is ignored (logged once). Options the block
+sampler does not apply (penalties, `min_p`, `min_new_tokens`, `logit_bias`, structured output, logprobs, custom
+logit processors) are refused with a 400.
 
 Load-test with an async HTTP client; a single OpenAI-SDK Python process saturates by itself.
 Latencies: HTTP chat, max 160 new tokens, a 350M checkpoint of this architecture.

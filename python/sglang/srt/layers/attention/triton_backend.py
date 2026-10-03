@@ -188,6 +188,17 @@ class TritonAttnBackend(AttentionBackend):
         self._translate_kv_loc = getattr(
             self.token_to_kv_pool_allocator, "translate_kv_loc_dense", None
         ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
+        # Uniform per-request query width of a DLLM_EXTEND forward (for graph
+        # shapes); resolved here since the backend keeps no model_runner.
+        self._dllm_block_size = None
+        if getattr(model_runner.server_args, "dllm_algorithm", None) is not None:
+            from sglang.srt.dllm.config import DllmConfig
+
+            _dc = DllmConfig.from_server_args(model_runner.server_args)
+            self._dllm_block_size = None if _dc is None else int(_dc.block_size)
+        # Width of the dLLM graph being captured/replayed, set by the graph
+        # runner (graph metadata gets no ForwardBatch). None = single block.
+        self._dllm_active_width = None
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
@@ -298,6 +309,20 @@ class TritonAttnBackend(AttentionBackend):
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
+
+        # dLLM split-prefix attention for bidirectional denoise/readout (see
+        # dllm_splitkv.py); per-call gates decide later. Excluded under the
+        # deterministic kernel and under DCP (needs partial outputs).
+        self.use_dllm_splitkv = (
+            envs.SGLANG_DLLM_USE_SPLIT_PREFIX_ATTN.get()
+            and self._dllm_block_size is not None
+            and not self.enable_deterministic
+            and self.dcp_size == 1
+        )
+        if self.use_dllm_splitkv:
+            from sglang.kernels.ops.attention.dllm_splitkv import dllm_splitkv_fwd
+
+            self.dllm_splitkv_fwd = torch.compiler.disable(dllm_splitkv_fwd)
 
         # TODO(Jianan Ji): verify behavior when kv_indptr_buf is provided and sliding window is enabled
         if kv_indptr_buf is None:
@@ -500,14 +525,29 @@ class TritonAttnBackend(AttentionBackend):
             )
         return kv_indptr, window_kv_indptr, window_kv_lens, num_kv_splits_lens
 
+    def _dllm_query_width(self) -> Optional[int]:
+        """Uniform per-request query width for a DLLM_EXTEND graph shape.
+
+        block_size, or 2*block_size under commit fusion (``_dllm_active_width``).
+        """
+        if self._dllm_active_width is not None:
+            return int(self._dllm_active_width)
+        return self._dllm_block_size
+
     def _update_target_verify_buffers(
         self,
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         spec_info,
+        query_width: Optional[int] = None,
+        kv_lens: Optional[torch.Tensor] = None,
     ):
-        """Fill all cuda-graph buffers for target_verify mode."""
+        """Fill all cuda-graph buffers for target_verify mode.
+
+        ``query_width`` / ``kv_lens`` override the per-request query count and
+        KV length; DLLM_EXTEND passes prefix-only KV lengths.
+        """
         # Prefer the spec_info's per-request query length (DSpark draft propose
         # uses gamma < verify window); fall back to the configured verify window.
         num_draft_tokens = self.num_draft_tokens
@@ -516,6 +556,8 @@ class TritonAttnBackend(AttentionBackend):
             and getattr(spec_info, "draft_token_num", None) is not None
         ):
             num_draft_tokens = int(spec_info.draft_token_num)
+        if query_width is not None:
+            num_draft_tokens = int(query_width)
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
@@ -525,7 +567,10 @@ class TritonAttnBackend(AttentionBackend):
             device=self.device,
         )
         kv_indptr = self._fill_kv_indptr_and_indices(
-            bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+            bs,
+            seq_lens if kv_lens is None else kv_lens,
+            req_pool_indices,
+            self.cuda_graph_kv_indices,
         )
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
@@ -540,7 +585,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.window_kv_indptr,
                     self.req_to_token,
                     self.sliding_window_size,
-                    seq_lens[:bs],
+                    (seq_lens if kv_lens is None else kv_lens)[:bs],
                     req_pool_indices,
                     bs,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -716,12 +761,22 @@ class TritonAttnBackend(AttentionBackend):
         # non-None but stale slice for gpu_only batches). None -> fall back to a
         # per-step D2H `.item()` on the indptr.
         have_cpu_mirror = forward_batch.seq_lens_sum is not None
-        # Full-attention read path. kv_indptr[bs] == seq_lens_sum.
-        n_kv = (
-            forward_batch.seq_lens_sum
-            if have_cpu_mirror
-            else int(self.kv_indptr[bs].item())
-        )
+        # Full-attention read path. kv_indptr[bs] == seq_lens_sum, except for
+        # DLLM_EXTEND, whose kv_indices cover only the prefix.
+        if forward_batch.forward_mode == ForwardMode.DLLM_EXTEND:
+            # From the CPU mirror to avoid a per-replay sync; subtract the active
+            # width, not block_size, so a fused window is not counted as prefix.
+            w = self._dllm_query_width()
+            if have_cpu_mirror and w is not None:
+                n_kv = int((forward_batch.seq_lens_cpu[:bs] - w).clamp_min(0).sum())
+            else:
+                n_kv = int(self.kv_indptr[bs].item())
+        else:
+            n_kv = (
+                forward_batch.seq_lens_sum
+                if have_cpu_mirror
+                else int(self.kv_indptr[bs].item())
+            )
         if n_kv > 0:
             self.cuda_graph_kv_indices[:n_kv] = self._translate_kv_loc(
                 self.cuda_graph_kv_indices[:n_kv]
@@ -753,6 +808,41 @@ class TritonAttnBackend(AttentionBackend):
             self._translate_kv_loc(out_cache_loc)
         )
         return self.cuda_graph_out_cache_loc_full_physical[:n]
+
+    @staticmethod
+    def _dllm_avg_prefix(forward_batch) -> Optional[float]:
+        """Average committed prefix per request, from host lists only (graph-safe);
+        None when the batch lacks the host lengths."""
+        sl = getattr(forward_batch, "seq_lens_cpu", None)
+        el = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if sl is None or el is None:
+            return None
+        sl = sl.tolist() if hasattr(sl, "tolist") else list(sl)
+        if len(sl) == 0 or len(sl) != len(el):
+            return None
+        return sum(max(0, int(a) - int(b)) for a, b in zip(sl, el)) / len(sl)
+
+    def dllm_split_wanted(self, forward_batch) -> bool:
+        """Whether a forward takes the split-prefix attention path.
+
+        Shared by eager dispatch and the graph runner so both pick the same kernel;
+        only non-KV-persisting denoise/readout with a long enough host-side prefix."""
+        if not self.use_dllm_splitkv:
+            return False
+        if forward_batch.dllm_causal_override is not False:
+            return False
+        if forward_batch.dllm_save_kv:
+            return False
+        if forward_batch.dllm_causal_rows is not None:
+            return False
+        if forward_batch.dllm_clean_upto > 0:
+            return False
+        avg = self._dllm_avg_prefix(forward_batch)
+        if avg is None:
+            return False
+        from sglang.srt.environ import envs as _envs
+
+        return avg >= int(_envs.SGLANG_DLLM_SPLIT_PREFIX_ATTN_MIN_PREFIX.get())
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -1203,6 +1293,35 @@ class TritonAttnBackend(AttentionBackend):
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
+        elif forward_mode == ForwardMode.DLLM_EXTEND:
+            width = self._dllm_query_width()
+            if width is None:
+                raise ValueError(
+                    "DLLM_EXTEND cuda graph requested but no dLLM config is "
+                    "resolvable on this backend"
+                )
+            return ForwardMetadata(
+                attn_logits=None,
+                attn_lse=None,
+                # must equal the per-request query count in qo_indptr
+                max_extend_len=width,
+                num_kv_splits=None,
+                kv_indptr=self.kv_indptr[: bs + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                qo_indptr=self.qo_indptr[: bs + 1],
+                # No custom mask: causality comes from the `causal` flag,
+                # baked per captured graph.
+                custom_mask=None,
+                mask_indptr=None,
+                window_kv_indptr=self.window_kv_indptr[: bs + 1] if swa else None,
+                window_kv_indices=self.cuda_graph_window_kv_indices if swa else None,
+                window_num_kv_splits=(
+                    self.cuda_graph_window_num_kv_splits if swa else None
+                ),
+                window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
+                swa_out_cache_loc=swa_out_cache_loc,
+                out_cache_loc_full_physical=out_cache_loc_full_physical,
+            )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
 
@@ -1239,6 +1358,24 @@ class TritonAttnBackend(AttentionBackend):
         elif forward_mode.is_draft_extend_v2():
             self._update_draft_extend_buffers(
                 bs, seq_lens, req_pool_indices, forward_mode, spec_info
+            )
+        elif forward_mode == ForwardMode.DLLM_EXTEND:
+            # Uniform-width extend: target-verify buffers with the dLLM width.
+            width = self._dllm_query_width()
+            if width is None:
+                raise ValueError(
+                    "DLLM_EXTEND cuda graph requested but no dLLM config is "
+                    "resolvable on this backend"
+                )
+            # KV range is the prefix only, as in the eager extend path; including
+            # the window would attend it twice (wrong under bidirectional).
+            self._update_target_verify_buffers(
+                bs,
+                seq_lens,
+                req_pool_indices,
+                spec_info,
+                query_width=width,
+                kv_lens=torch.clamp(seq_lens[:bs] - width, min=0).to(torch.int32),
             )
         else:
             raise ValueError(
@@ -1369,6 +1506,11 @@ class TritonAttnBackend(AttentionBackend):
         ):
             causal = False
 
+        # dLLM per-forward causality: denoise is bidirectional, commit is causal
+        # so persisted KV matches AR. A python bool, so graph-capture safe.
+        if forward_batch.dllm_causal_override is not None:
+            causal = forward_batch.dllm_causal_override
+
         if self.dcp_size > 1:
             if score_mod is not None:
                 raise NotImplementedError(
@@ -1380,6 +1522,15 @@ class TritonAttnBackend(AttentionBackend):
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
+            if forward_batch.dllm_causal_rows is not None:
+                raise NotImplementedError(
+                    "per-request dLLM causality (dllm_causal_rows) is not wired "
+                    "into the deterministic unified extend kernel. Ignoring it "
+                    "here would run a causal commit row bidirectionally -- wrong "
+                    "tokens, no error -- so refuse instead. Run without "
+                    "--enable-deterministic, or extend _fwd_kernel_unified the "
+                    "same way _fwd_kernel was."
+                )
             return self._forward_extend_unified(
                 q,
                 o,
@@ -1459,6 +1610,55 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        # dLLM split-prefix path for denoise/readout over a long prefix;
+        # returns False outside its gates and falls through. dllm_split_attn
+        # is baked by the graph runner, else decided from host lengths.
+        _want_split = (
+            forward_batch.dllm_split_attn
+            if forward_batch.dllm_split_attn is not None
+            else (self.use_dllm_splitkv and self.dllm_split_wanted(forward_batch))
+        )
+        if (
+            _want_split
+            and forward_batch.forward_mode.is_dllm_extend()
+            and causal is False
+            and not save_kv_cache
+            and self.dllm_splitkv_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                causal,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                clean_upto=forward_batch.dllm_clean_upto,
+                causal_rows=forward_batch.dllm_causal_rows,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,
+                window_kv_offsets=window_kv_offsets,
+                xai_temperature_len=layer.xai_temperature_len,
+                page_size=self.page_size,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                max_bs=self.req_to_token_pool.size,
+                # threshold already applied above from host lengths
+                min_prefix=0,
+                avg_prefix=self._dllm_avg_prefix(forward_batch),
+            )
+        ):
+            return o
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -1485,6 +1685,10 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            clean_upto=forward_batch.dllm_clean_upto,
+            causal_rows=forward_batch.dllm_causal_rows,
+            # widens the short-window tile bound to 256 queries (dLLM only)
+            dllm_extend=forward_batch.forward_mode.is_dllm_extend(),
         )
         return o
 
@@ -1573,6 +1777,8 @@ class TritonAttnBackend(AttentionBackend):
                 xai_temperature_len=layer.xai_temperature_len,
                 lse_extend=current_lse,
                 skip_prefix=True,
+                clean_upto=forward_batch.dllm_clean_upto,
+                causal_rows=forward_batch.dllm_causal_rows,
             )
 
         if kv_indices.numel() == 0:
@@ -1618,6 +1824,8 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
             lse_extend=prefix_lse,
             skip_extend=True,
+            clean_upto=forward_batch.dllm_clean_upto,
+            causal_rows=forward_batch.dllm_causal_rows,
         )
 
         prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
@@ -1711,10 +1919,24 @@ class TritonAttnBackend(AttentionBackend):
                 extend_seq_lens = torch.full(
                     (bs,), draft_token_num, dtype=torch.int32, device=self.device
                 )
+            elif (
+                forward_batch.forward_mode == ForwardMode.DLLM_EXTEND
+                and self._dllm_query_width() is not None
+            ):
+                # dLLM graph batches carry no extend_seq_lens; every request's
+                # query count is the uniform width.
+                extend_seq_lens = torch.full(
+                    (bs,),
+                    int(self._dllm_query_width()),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             else:
                 raise RuntimeError(
-                    "extend_seq_lens is None but cannot infer from spec_info. "
-                    "This should not happen in TARGET_VERIFY mode."
+                    "extend_seq_lens is None and cannot be inferred: no "
+                    "spec_info (target verify) and not a uniform-width "
+                    f"DLLM_EXTEND (mode={forward_batch.forward_mode}, "
+                    f"dllm width={self._dllm_query_width()})."
                 )
         else:
             extend_seq_lens = forward_batch.extend_seq_lens
@@ -1778,6 +2000,7 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            clean_upto=forward_batch.dllm_clean_upto,
         )
 
         return o

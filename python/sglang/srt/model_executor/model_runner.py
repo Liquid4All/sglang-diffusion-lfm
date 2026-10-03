@@ -794,7 +794,10 @@ class ModelRunner:
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
-        num_tokens_per_req = self.decode_num_tokens_per_req()
+        # The dLLM decode graph asks for its widest window (2*block under commit fusion).
+        num_tokens_per_req = DllmConfig.logits_rows_per_req(
+            self.server_args, self.decode_num_tokens_per_req()
+        )
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         return max(capture_bs) * num_tokens_per_req
 
@@ -1671,6 +1674,10 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            # Deferred mamba COW/clear before anything reads the pool, above the
+            # graph branch: a graph-replayed extend must also see the fixed-up pool.
+            self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
@@ -1686,10 +1693,6 @@ class ModelRunner:
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
-
-            # Deferred mamba COW/clear on the forward stream, before the extend
-            # dispatch below reads the pool.
-            self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
 
             dwdp_mgr = get_global_dwdp_manager()
             if dwdp_mgr is not None:

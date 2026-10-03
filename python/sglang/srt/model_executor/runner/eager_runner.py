@@ -277,7 +277,16 @@ class EagerRunner(BaseRunner):
         # the final batch every time; eager metadata is intentionally derived
         # directly from the live ``spec_info`` tensors.
         if (
-            forward_batch.needs_forward_metadata_init()
+            (
+                forward_batch.needs_forward_metadata_init()
+                # dLLM denoise steps re-run the SAME positions with the same
+                # batch and token count, and the algorithm marks the plan
+                # reusable after the block's first forward. The graph runner
+                # honours that in load_batch; this path did not, so every eager
+                # step re-planned -- and the short-conv plan's .tolist() is a
+                # device sync per forward, illegal under an enclosing capture.
+                and not forward_batch.attn_metadata_ready
+            )
             or cp_v2_active
             or forward_batch.forward_mode.is_target_verify()
         ):

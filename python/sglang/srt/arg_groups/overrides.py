@@ -2604,6 +2604,20 @@ def _gguf_quantization(view: Any) -> dict:
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
+    # DuoBlock needs triton, the only backend honouring every mask it sends;
+    # decided before the per-platform branches, which would override it.
+    if view.dllm_algorithm == "DuoBlock":
+        if envs.SGLANG_DLLM_DEBUG_ALLOW_NONTRITON_ATTENTION.get():
+            # Debug escape hatch: keep the requested backend for A/B runs.
+            return {}
+        if view.attention_backend != "triton":
+            logger.warning(
+                "Attention backend is set to triton for DuoBlock diffusion "
+                "inference (other backends ignore the per-forward causality "
+                "override and would denoise causally)"
+            )
+            return {"attention_backend": "triton"}
+        return {}
     if is_hip():
         if view.attention_backend not in ["triton", "aiter"]:
             logger.warning(
@@ -2644,6 +2658,17 @@ def _dllm_page_size(view: Any) -> dict:
     from sglang.srt.dllm.config import DllmConfig
 
     config = DllmConfig.from_server_args(view)
+    if getattr(config, "anchored", False):
+        # Anchored grids need no block-aligned pages, but a page larger than a
+        # block would over-allocate every block.
+        if view.page_size > config.block_size:
+            logger.warning(
+                f"The page size {view.page_size} should not be larger than "
+                f"dllm block size {config.block_size}. Page size now falls "
+                f"back to {config.block_size}"
+            )
+            return {"page_size": config.block_size}
+        return {}
     if not view.disable_radix_cache and view.page_size % config.block_size != 0:
         logger.warning(
             f"Setting page size to {config.block_size} for diffusion LLM inference"

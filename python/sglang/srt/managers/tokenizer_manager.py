@@ -370,6 +370,21 @@ _SERVER_ARGS_FIELDS = frozenset(f.name for f in dataclasses.fields(ServerArgs))
 
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
+# Sampling options the dLLM samplers do not apply, each with its unset value; a
+# request that sets one gets a 400 instead of silently unhonored output.
+_DLLM_UNSUPPORTED_SAMPLING = (
+    ("frequency_penalty", 0.0),
+    ("presence_penalty", 0.0),
+    ("repetition_penalty", 1.0),
+    ("min_new_tokens", 0),
+    ("min_p", 0.0),
+    ("logit_bias", None),
+    ("json_schema", None),
+    ("regex", None),
+    ("ebnf", None),
+    ("structural_tag", None),
+)
+
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
@@ -393,6 +408,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        # dLLM per-request NFE bounds; validating at admission returns a 400
+        # instead of an assertion that takes down the scheduler.
+        from sglang.srt.dllm.params import steps_per_block_bounds_from_server_args
+
+        self._dllm_nfe_bounds = steps_per_block_bounds_from_server_args(server_args)
+        # Bidirectional prefix attention needs a one-segment prefill, so a
+        # prompt over the prefill allowance would wait forever; reject it.
+        self._dllm_one_shot_prefill_limit = (
+            int(server_args.max_prefill_tokens)
+            if (
+                server_args.dllm_algorithm is not None
+                and server_args.dllm_prefix_attention == "bidirectional"
+            )
+            else None
+        )
         self.startup_time: Optional[Dict[str, Any]] = None
         self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
         self.elastic_worker_count = server_args.dp_size
@@ -458,6 +488,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
+        from sglang.srt.dllm.config import dllm_reserved_prompt_id
+
+        self._dllm_reserved_prompt_id = (
+            dllm_reserved_prompt_id(self.model_config.hf_config)
+            if server_args.dllm_algorithm is not None
+            else None
+        )
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
         self.num_reserved_tokens = compute_num_reserved_tokens(server_args)
@@ -1387,6 +1424,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        self._verify_dllm_sampling_params(sampling_params)
+        self._verify_dllm_prompt_len(input_ids, input_embeds)
+        self._verify_dllm_request(obj, input_ids)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -1721,6 +1761,83 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return out
 
         return None
+
+    def _verify_dllm_prompt_len(self, input_ids, input_embeds=None):
+        limit = self._dllm_one_shot_prefill_limit
+        if limit is None:
+            return
+        # input_embeds requests hit the same one-shot prefill limit.
+        prompt = input_ids if input_ids is not None else input_embeds
+        if prompt is None:
+            return
+        n = len(prompt)
+        if n > limit:
+            raise ValueError(
+                f"prompt is {n} positions but --dllm-prefix-attention "
+                f"bidirectional requires it to be prefilled in one segment, "
+                f"and --max-prefill-tokens is {limit}. Raise "
+                "--max-prefill-tokens, shorten the prompt, or serve with "
+                "--dllm-prefix-attention causal (which prefills correctly in "
+                "chunks)."
+            )
+
+    def _verify_dllm_request(self, obj, input_ids):
+        """Reject what the dLLM path cannot serve: a 400 here, not a scheduler fault."""
+        if self.server_args.dllm_algorithm is None:
+            return
+        if isinstance(obj, GenerateReqInput) and (
+            obj.return_logprob or obj.top_logprobs_num or obj.token_ids_logprob
+        ):
+            raise ValueError(
+                "return_logprob is not supported with --dllm-algorithm: block "
+                "diffusion emits tokens without per-token logprobs."
+            )
+        if isinstance(obj, GenerateReqInput) and obj.custom_logit_processor:
+            raise ValueError(
+                "custom_logit_processor is not supported with --dllm-algorithm: "
+                "the block sampler does not run logit processors."
+            )
+        reserved = self._dllm_reserved_prompt_id
+        if reserved is not None and input_ids is not None and reserved in input_ids:
+            raise ValueError(
+                f"input_ids contains token id {reserved}, the canvas placeholder "
+                "of this diffusion model; it would be read as an undecoded position."
+            )
+
+    def _verify_dllm_sampling_params(self, sampling_params):
+        """Reject sampling options the dLLM sampler does not apply, and an
+        out-of-range ``dllm_steps_per_block``, at admission.
+
+        The upper bound lives in the server's algorithm config, which
+        ``SamplingParams.verify`` cannot see.
+        """
+        if self.server_args.dllm_algorithm is not None:
+            unsupported = [
+                name
+                for name, unset in _DLLM_UNSUPPORTED_SAMPLING
+                if getattr(sampling_params, name) not in (unset, {})
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"{', '.join(unsupported)} not supported with --dllm-algorithm: "
+                    "the block sampler applies only temperature, top_p, top_k and "
+                    "dllm_steps_per_block."
+                )
+        spb = sampling_params.dllm_steps_per_block
+        if spb is None:
+            return
+        if self._dllm_nfe_bounds is None:
+            raise ValueError(
+                "dllm_steps_per_block was set but this server is not running a "
+                "diffusion LLM algorithm (--dllm-algorithm is unset)."
+            )
+        _, ceiling = self._dllm_nfe_bounds
+        if not 1 <= spb <= ceiling:
+            raise ValueError(
+                f"dllm_steps_per_block must be in [1, {ceiling}], got {spb}. "
+                "Raise max_steps_per_block in the server's --dllm-algorithm-config "
+                "to allow more denoising steps per block."
+            )
 
     async def _wait_one_response(
         self,

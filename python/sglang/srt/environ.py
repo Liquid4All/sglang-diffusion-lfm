@@ -140,6 +140,17 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
+class EnvBoolStrict(EnvBool):
+    """A boolean whose malformed value raises instead of falling back to the default,
+    which would silently leave a default-on flag (e.g. SGLANG_DLLM_FUSED_NORM) on."""
+
+    def get(self) -> Any:
+        raw = os.getenv(self.name)
+        if raw is not None and not self._set_to_none:
+            return self.parse(raw)  # ValueError propagates on purpose
+        return super().get()
+
+
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -177,6 +188,10 @@ class _DeprecatedEnvFallback:
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
     pass
+
+
+class EnvBoolStrictWithAlias(_DeprecatedEnvFallback, EnvBoolStrict):
+    """EnvBoolStrict that also honours a deprecated alias."""
 
 
 class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
@@ -1183,6 +1198,116 @@ class Envs:
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+    # dLLM: allow a denoise block's first forward to replay a graph, with the
+    # runner taking the pre-block conv snapshot; set 0 to force it eager.
+    SGLANG_DLLM_ENABLE_GRAPH_FIRST_FORWARD = EnvBool(True)
+    # dLLM: carry attention causality as a per-request graph-slot tensor
+    # instead of a batch-uniform bool baked at capture. Opt-in.
+    SGLANG_DLLM_ENABLE_TENSOR_CAUSALITY = EnvBool(False)
+    # dLLM debug only: keep a non-triton attention backend for DuoBlock. Needs
+    # --disable-cuda-graph, commit_fusion off and tensor causality off.
+    SGLANG_DLLM_DEBUG_ALLOW_NONTRITON_ATTENTION = EnvBool(False)
+
+    # ===================================================================
+    # Block-diffusion (dLLM): fused-kernel fast path
+    # ===================================================================
+    # Master switch for the default-on set below; an explicitly set flag wins.
+    SGLANG_DLLM_FUSED_DEFAULTS = EnvBoolStrict(True)
+    # The default-on set: not byte-identical to unfused (reduction order); each
+    # falls back to eager on a shape it does not support.
+    SGLANG_DLLM_FUSED_NORM = EnvBoolStrict(
+        lambda: envs.SGLANG_DLLM_FUSED_DEFAULTS.get()
+    )
+    SGLANG_DLLM_FUSE_SILU_MUL = EnvBoolStrict(
+        lambda: envs.SGLANG_DLLM_FUSED_DEFAULTS.get()
+    )
+    SGLANG_DLLM_FUSE_ADALN_NORM = EnvBoolStrict(
+        lambda: envs.SGLANG_DLLM_FUSED_DEFAULTS.get()
+    )
+    SGLANG_DLLM_PREPLAN_ATTN = EnvBoolStrict(
+        lambda: envs.SGLANG_DLLM_FUSED_DEFAULTS.get()
+    )
+    # Opt-in w1/w3 GEMM merge in the MLP; inexact against the unfused MLP.
+    SGLANG_DLLM_FUSE_MLP_GEMM = EnvBoolStrict(False)
+    # Opt-in split-prefix (flash-decode style) attention for denoise/readout
+    # forwards, never the commit forward. Not bitwise (LSE merge).
+    SGLANG_DLLM_USE_SPLIT_PREFIX_ATTN = EnvBoolStrict(False)
+    # Average committed-prefix length (tokens) below which split-prefix attention
+    # uses the single launch; measured crossover.
+    SGLANG_DLLM_SPLIT_PREFIX_ATTN_MIN_PREFIX = EnvInt(512)
+    # FDFO for a lockstep algorithm (DuoBlock): forward+step iterations per
+    # scheduler round while no row is done. Ignored by the masked algorithms.
+    SGLANG_DLLM_FDFO_STEPS_PER_CALL = EnvInt(8)
+    # Gated short conv (B*x -> conv -> C*y) as one Triton launch; up to 1 bf16
+    # ULP off on ROCm. A FUSED_DEFAULTS member.
+    SGLANG_DLLM_FUSE_SCONV = EnvBoolStrict(
+        lambda: envs.SGLANG_DLLM_FUSED_DEFAULTS.get()
+    )
+    # Attention prologue (q/k RMSNorm + neox RoPE + contiguous v) as one Triton
+    # launch per layer, where q/k norms run the Triton norm. A FUSED_DEFAULTS member.
+    SGLANG_DLLM_FUSE_QKV = EnvBoolStrict(lambda: envs.SGLANG_DLLM_FUSED_DEFAULTS.get())
+    # The post-forward sampler as one Triton launch per canvas row; not bitwise
+    # (online softmax). A FUSED_DEFAULTS member.
+    SGLANG_DLLM_FUSE_DENOISE_STEP = EnvBoolStrictWithAlias(
+        lambda: envs.SGLANG_DLLM_FUSED_DEFAULTS.get(),
+        deprecated_name="SGLANG_DLLM_FUSE_READOUT",
+    )
+    # Install a fused kernel even where its eligibility check declined, for
+    # A/B measurement against a real fallback. Never for serving.
+    SGLANG_DLLM_FORCE_FUSED = EnvBoolStrict(False)
+
+    # ===================================================================
+    # Block-diffusion (dLLM): debug and instrumentation
+    # ===================================================================
+    # Path the fused-kernel installer appends its live install counts to, so a
+    # benchmark can certify what was installed rather than requested.
+    SGLANG_DLLM_FUSED_MARKER = EnvStr(None)
+    # Per-forward timing / torch profiler / per-block instrumentation.
+    SGLANG_DLLM_TIMING = EnvBool(False)
+    SGLANG_DLLM_PROFILE = EnvBool(False)
+    SGLANG_DLLM_TIMING_SKIP = EnvInt(2)
+    SGLANG_DLLM_INSTR_OUT = EnvStr("")
+    # Tag written into every SGLANG_DLLM_INSTR_OUT record so concurrent jobs
+    # sharing a sink can be told apart.
+    SGLANG_DLLM_RUN_ID = EnvStr("")
+    # Append one JSON line of wall-clock times, round kind and request ids per
+    # dLLM scheduler round to this path; unset = off.
+    SGLANG_DLLM_ROUND_TRACE = EnvStr(None)
+    # Dump the per-block sampler state to this path.
+    SGLANG_DLLM_STATE_DUMP = EnvStr(None)
+    # Cross-check each block against an AR reference forward.
+    SGLANG_DLLM_VERIFY_AR = EnvBool(False)
+    # Teacher-forced canvas to replay instead of the model's own tokens.
+    SGLANG_DLLM_TEACHER_CANVAS = EnvStr("")
+    # Parity debugging: path to append one record per reverse step (canvas
+    # after the step, top-2 beliefs).
+    SGLANG_DUO_TRACE = EnvStr(None)
+    # Comma-separated device-synchronize sites to keep ("all" = every site);
+    # unset = the platform-default forward barrier, empty = none.
+    SGLANG_DLLM_SYNC_SITES = EnvStr(None)
+    # Trace logging for the prefix-cache path.
+    SGLANG_DLLM_PREFIX_TRACE = EnvBool(False)
+    # Capture the dLLM graphs but never replay them: every forward runs eager (graph == eager control).
+    SGLANG_DLLM_GRAPH_CAPTURE_ONLY = EnvBool(False)
+    # Test hook: after each clean prompt prefill, torch.save the prompt ids, the prompt rows'
+    # logits and the request's post-prefill conv state into this directory (one file each).
+    SGLANG_DLLM_DEBUG_PREFILL_DUMP_DIR = EnvStr(None)
+    # Test hook: treat the conv state as non-static, snapshot and restore it around every
+    # forward, even when every conv layer runs the fused kernel. Same kernels, different
+    # state handling, so a run with it must match one without.
+    SGLANG_DLLM_DEBUG_CONV_RESTORE = EnvBool(False)
+    # dLLM: record a whole block (forwards plus sampler steps) as one CUDA graph;
+    # ineligible blocks fall back to per-forward graphs. Unset = on for DuoBlock,
+    # off for other algorithms (dllm/params.py: GRAPHED_BY_DEFAULT).
+    SGLANG_DLLM_ENABLE_BLOCK_GRAPH = EnvBool(False)
+    # dLLM prefill coalescing: while requests decode, prefill only once PREFILL_BATCH
+    # prompts wait or the oldest waited PREFILL_MAX_WAIT_MS. Defaults = prefill first.
+    SGLANG_DLLM_PREFILL_BATCH = EnvInt(1)
+    SGLANG_DLLM_PREFILL_MAX_WAIT_MS = EnvFloat(0.0)
+    # Graph the prompt prefill of a single prompt shorter than block_size by
+    # padding it to block_size. Not bitwise equal to eager. Unset = on for DuoBlock,
+    # off for other algorithms (dllm/params.py: GRAPHED_BY_DEFAULT).
+    SGLANG_DLLM_ENABLE_GRAPH_PROMPT_PREFILL = EnvBool(False)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

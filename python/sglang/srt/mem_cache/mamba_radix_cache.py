@@ -60,6 +60,7 @@ if TYPE_CHECKING:
 
 import logging
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -641,6 +642,20 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     prev_prefix_len=req.cache_protected_len,
                 )
             )
+            if envs.SGLANG_DLLM_PREFIX_TRACE.get():
+                # A node without mamba_value never advances best_value_len, so
+                # later matches report prefix=0.
+                logger.warning(
+                    "dllm-donate-trace: key_len=%d page_aligned=%d "
+                    "mamba_value=%s cache_len=%s inserted_prefix=%d "
+                    "mamba_exist=%s",
+                    len(token_ids),
+                    page_aligned_len,
+                    None if mamba_value is None else tuple(mamba_value.shape),
+                    cache_len,
+                    result.prefix_len,
+                    result.mamba_exist,
+                )
             mamba_exist = result.mamba_exist
             if mamba_exist and self.int8_ckpt_pool is not None:
                 # state already cached -> the int8 slot we just allocated is a duplicate
@@ -1123,6 +1138,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_value_len = len(value)
             best_last_node = node
 
+        if envs.SGLANG_DLLM_PREFIX_TRACE.get():
+            logger.warning(
+                "dllm-match-trace: matched_nodes=%d best_value_len=%d "
+                "node_has_mamba=%s tokens_matched=%d",
+                len(value),
+                best_value_len,
+                node.mamba_value is not None,
+                sum(v.numel() for v in value),
+            )
         return value, best_last_node, best_value_len
 
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:

@@ -77,6 +77,22 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        self.cached_cuda_graph_dllm_query_start_loc: Optional[torch.Tensor] = None
+        # Uniform per-request query width of a DLLM_EXTEND forward; None
+        # outside dLLM deployments.
+        self._dllm_block_size: Optional[int] = None
+        # All DLLM_EXTEND widths (commit fusion adds 2*block_size); the
+        # query_start_loc stride is per-width, so each needs its own table.
+        self._dllm_widths: tuple = ()
+        # Published by the decode graph runner at capture/replay. Must exist
+        # up front: the publisher hasattr()-checks it and otherwise no-ops.
+        self._dllm_active_width: Optional[int] = None
+        if getattr(model_runner.server_args, "dllm_algorithm", None) is not None:
+            from sglang.srt.dllm.config import DllmConfig
+
+            _dc = DllmConfig.from_server_args(model_runner.server_args)
+            self._dllm_block_size = None if _dc is None else int(_dc.block_size)
+            self._dllm_widths = () if _dc is None else _dc.decode_widths()
         self.conv_states_shape: tuple[int, int] = None
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
@@ -468,6 +484,24 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
+        # DLLM_EXTEND is a uniform-width extend (same layout as target-verify).
+        # One table per width: a wrong-stride table yields wrong query ranges
+        # with no shape error.
+        self.cached_cuda_graph_dllm_query_start_loc = None
+        self._cg_dllm_qsl_by_width: dict = {}
+        for _w in self._dllm_widths or ():
+            self._cg_dllm_qsl_by_width[int(_w)] = torch.arange(
+                0,
+                max_bs * int(_w) + 1,
+                step=int(_w),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if self._dllm_block_size is not None:
+            # Default for callers that never publish a width (unfused).
+            self.cached_cuda_graph_dllm_query_start_loc = (
+                self._cg_dllm_qsl_by_width.get(int(self._dllm_block_size))
+            )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
@@ -485,6 +519,36 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
+
+    def _dllm_qsl_width(self) -> int:
+        """Width to index the query_start_loc tables with."""
+        if self._dllm_active_width is not None:
+            return int(self._dllm_active_width)
+        if len(self._dllm_widths) > 1:
+            # Guessing a width would fail silently (right shapes, wrong ranges).
+            raise ValueError(
+                "DLLM_EXTEND cuda graph with commit fusion needs an active "
+                f"width published by the decode graph runner; widths="
+                f"{self._dllm_widths} and none is active. A guess here would "
+                "build wrong query ranges at correct shapes."
+            )
+        return int(self._dllm_block_size)
+
+    def _require_dllm_qsl(self) -> torch.Tensor:
+        if not self._cg_dllm_qsl_by_width:
+            raise ValueError(
+                "DLLM_EXTEND cuda graph requested but this hybrid backend "
+                "resolved no dLLM block size; --dllm-algorithm must be set "
+                "before cuda-graph state is initialised."
+            )
+        w = self._dllm_qsl_width()
+        qsl = self._cg_dllm_qsl_by_width.get(w)
+        if qsl is None:
+            raise ValueError(
+                f"no DLLM_EXTEND query_start_loc table for width {w}; "
+                f"captured widths are {sorted(self._cg_dllm_qsl_by_width)}"
+            )
+        return qsl
 
     def _capture_metadata(
         self,
@@ -508,6 +572,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
+        elif forward_mode == ForwardMode.DLLM_EXTEND:
+            self.query_start_loc_list[bs - 1].copy_(self._require_dllm_qsl()[: bs + 1])
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -696,6 +762,17 @@ class MambaAttnBackendBase(AttentionBackend):
                 )
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     (bs - num_padding) * spec_info.draft_token_num
+                )
+        elif forward_mode == ForwardMode.DLLM_EXTEND:
+            qsl = self._require_dllm_qsl()
+            if num_padding == 0:
+                self.query_start_loc_list[bs - 1].copy_(qsl[: bs + 1])
+            else:
+                # Padded rows get zero queries (mirrors the verify path).
+                real = bs - num_padding
+                self.query_start_loc_list[bs - 1][:real].copy_(qsl[:real])
+                self.query_start_loc_list[bs - 1][real:].fill_(
+                    real * self._dllm_qsl_width()
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -1015,8 +1092,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.init_forward_metadata_in_graph(forward_batch)
 
     def on_after_cuda_graph_warmup(self):
+        # Sum the children's reports so the caller can verify the wipe.
+        cleared = []
         for attn_backend in self.attn_backend_list:
-            attn_backend.on_after_cuda_graph_warmup()
+            r = attn_backend.on_after_cuda_graph_warmup()
+            if r:
+                cleared.append(r)
+        return sum(cleared) if cleared else None
 
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
@@ -1283,6 +1365,13 @@ class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
         # attn_backend_list and inherits the metadata / cuda-graph fan-out.
         super().__init__(full_attn_backend, short_conv_backend, full_attn_layers)
         self.short_conv_backend = short_conv_backend
+
+    def conv_state_pool(self):
+        """Conv-state pool of the linear sub-backend (callers hasattr() the wrapper)."""
+        fn = getattr(self.linear_attn_backend, "conv_state_pool", None)
+        if fn is None:
+            raise AttributeError("linear backend exposes no conv_state_pool")
+        return fn()
 
     def conv_state_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.short_conv_backend.conv_state_metadata(layer_id, forward_batch)

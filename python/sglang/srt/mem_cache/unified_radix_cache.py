@@ -422,6 +422,28 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return self.tree_core.empty_match_result
         result = self.tree_core.match_prefix(params)
+        if envs.SGLANG_DLLM_PREFIX_TRACE.get():
+            _k = getattr(params, "key", None)
+            # Tree size separates matched=0 from an empty tree vs. a key mismatch.
+            try:
+                _ev = self.tree_core.evictable_size()
+                _pr = self.tree_core.protected_size()
+            except Exception:
+                _ev = _pr = -1
+            logger.warning(
+                "dllm-unified-match: key_len=%s matched=%s mamba_enabled=%s "
+                "disable=%s tree_evictable=%s tree_protected=%s",
+                None if _k is None else len(_k),
+                (
+                    None
+                    if result.device_indices is None
+                    else int(result.device_indices.numel())
+                ),
+                self.is_mamba_enabled,
+                self.disable,
+                _ev,
+                _pr,
+            )
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
@@ -437,6 +459,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
+        if envs.SGLANG_DLLM_PREFIX_TRACE.get():
+            logger.warning(
+                "dllm-unified-insert: key_len=%s value_len=%s mamba_value=%s",
+                None if params.key is None else len(params.key),
+                None if params.value is None else int(len(params.value)),
+                params.mamba_value is not None,
+            )
         # Fail fast on re-entrancy without touching the in-flight walk.
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         # Pump the resumable insert, applying each step's actions at its barrier.

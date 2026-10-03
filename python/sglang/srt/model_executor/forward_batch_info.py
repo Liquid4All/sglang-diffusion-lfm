@@ -38,6 +38,7 @@ import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.dllm.params import request_sampling_overrides
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -470,6 +471,76 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
 
+    # === dLLM per-step conditioning (set by the DllmAlgorithm before each
+    # forward; consumed only by diffusion models that declare support) ===
+    # Per-token noise level [num_tokens] float. None for time-agnostic models.
+    dllm_sigma: Optional[torch.Tensor] = None
+    # Per-token self-conditioning embedding [num_tokens, hidden]. None on
+    # forwards without self-conditioning; the model then applies none at all.
+    dllm_selfcond: Optional[torch.Tensor] = None
+    # Per-token adaLN base [T, 3*hidden], pre-selected by the algorithm. None
+    # -> the model derives it from dllm_sigma.
+    dllm_adaln_base: Optional[torch.Tensor] = None
+    # Whether this forward writes K/V and conv state (commit, prompt prefill,
+    # a fused block's wide first forward). Part of the graph key.
+    dllm_save_kv: bool = True
+    # Split-prefix attention (dllm_splitkv.py). None = decide live (eager); a
+    # bool is baked at graph capture and keyed by the graph runner.
+    dllm_split_attn: Optional[bool] = None
+    # Batch-uniform causality: True = causal, False = bidirectional, None = layer
+    # default. A python bool, so no host sync; baked per captured graph.
+    dllm_causal_override: Optional[bool] = None
+    # Per-request causality, [batch] int32, nonzero = causal; takes precedence
+    # over dllm_causal_override.
+    dllm_causal_rows: Optional[torch.Tensor] = None
+    # Conv-state snapshot: on a block's first forward the algorithm sets
+    # dllm_conv_capture and an empty dllm_conv_snapshot list; the graph runner or
+    # the eager model appends [(pool, cache_indices, saved_state)] once, and the
+    # algorithm restores it before each later forward. Writers must run after
+    # the deferred mamba clear/COW ops and their path's forward-metadata init.
+    dllm_conv_capture: bool = False
+    dllm_conv_snapshot: Optional[list] = None
+
+    # Per-request SamplingParams.dllm_steps_per_block, None where unset. Kept
+    # on the host to build the noise schedule without a device sync.
+    dllm_steps_per_block: Optional[List[Optional[int]]] = None
+
+    # Per-request greedy intent, on the host for the same reason. Uses
+    # `top_k == 1` because SamplingParams rewrites `temperature < eps` to
+    # `temperature=1.0, top_k=1`.
+    dllm_greedy: Optional[List[bool]] = None
+
+    # Per-request (temperature, top_p, top_k) set away from SGLang's defaults,
+    # None entries where left default; None when no request sets any. Host-side
+    # like dllm_steps_per_block.
+    dllm_sampling: Optional[List[tuple]] = None
+
+    # Per-request SamplingParams.ignore_eos: an ignore-EOS request must not
+    # have its block truncated by `ar_stop`. None when no request sets it.
+    dllm_ignore_eos: Optional[List[bool]] = None
+
+    # A clean prompt-prefill forward; never replays a block graph, even when the
+    # prompt is exactly block_size tokens.
+    dllm_prompt_prefill: bool = False
+    # Per-position self-conditioning gate, [T] or [T,1], 1 = apply; None
+    # applies it to every token.
+    dllm_selfcond_pos_mask: Optional[torch.Tensor] = None
+    # Per-request committed token count, int32 [batch_size]: the short conv
+    # carries its state after token n-1. None = after the last token.
+    dllm_conv_state_at: Optional[torch.Tensor] = None
+
+    # Commit fusion: leading window positions holding block k-1 (causal rows);
+    # 0 = unfused. Declared so the runners' replace()-copies keep it.
+    dllm_clean_upto: int = 0
+
+    # Block-diffusion phase ("denoise" | "readout" | "commit"), set by the
+    # algorithm. Diagnostics only (per-phase graph-eligibility gating).
+    dllm_phase: Optional[str] = None
+
+    # Set by the cuda-graph runner when this batch was served by a graph replay
+    # (diagnostics only; see SGLANG_DUO_TRACE in dllm/algorithm/duo_block.py).
+    dllm_graph_replayed: bool = False
+
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
     lora_ids: Optional[List[str]] = None
@@ -586,6 +657,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # marker is only valid for the planning regime (backend set) it was set
     # under; a fresh batch from init_new always starts unplanned.
     forward_metadata_ready: bool = False
+    # Skips only the attention plan, unlike forward_metadata_ready (which also
+    # skips fill_from), so per-step dLLM conditioning is still refreshed.
+    attn_metadata_ready: bool = False
     # Shapes the batch had when it was marked (plan record). Lets the
     # judgment predicate detect staleness when DP padding
     # (prepare_mlp_sync_batch) reshapes the batch after pre-planning.
@@ -848,17 +922,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
-            block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
+            # Positions are each request's extend window (any start, any length).
             ret.positions = torch.tensor(
                 [
                     i
-                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
-                    for i in range(block_offset, block_offset + block_size)
+                    for req in batch.reqs
+                    for i in range(req.extend_range.start, req.extend_range.end)
                 ],
                 dtype=positions_dtype,
             ).to(device, non_blocking=True)
+            _spb = [r.sampling_params.dllm_steps_per_block for r in batch.reqs]
+            ret.dllm_steps_per_block = (
+                _spb if any(v is not None for v in _spb) else None
+            )
+            _grd = [r.sampling_params.top_k == 1 for r in batch.reqs]
+            ret.dllm_greedy = _grd if any(_grd) else None
+            _smp = [request_sampling_overrides(r.sampling_params) for r in batch.reqs]
+            ret.dllm_sampling = (
+                _smp if any(v is not None for t in _smp for v in t) else None
+            )
+            _ign = [bool(r.sampling_params.ignore_eos) for r in batch.reqs]
+            ret.dllm_ignore_eos = _ign if any(_ign) else None
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

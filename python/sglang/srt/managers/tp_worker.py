@@ -569,6 +569,7 @@ class TpModelWorker(BaseTpWorker):
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             dllm_algo_state=dllm_algo_state,
             can_run_cuda_graph=can_run_cuda_graph,
+            copy_done=self.dllm_algorithm.copy_done,
         )
 
     def forward_batch_generation(

@@ -294,12 +294,39 @@ def alloc_for_extend(
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     reuse_kv = None
+    reuse_lead = None
     if batch.is_dllm():
         reuse_kv = [
             r.req_pool_idx is not None and bool(r.dllm_incomplete_ids)
             for r in batch.reqs
         ]
-
+        # Commit fusion: leading extend positions beyond the block_size canvas are
+        # the carried block k-1, which already owns KV slots.
+        reuse_lead = []
+        for i, r in enumerate(batch.reqs):
+            hold = r.dllm_prefix_holdback() if hasattr(r, "dllm_prefix_holdback") else 0
+            lead_i = 0
+            # Gate on the phase, not length: prompt positions would otherwise
+            # "reuse" unallocated (zero) slots and silently alias.
+            if hold and not r.is_dllm_prefill():
+                el = int(batch.extend_lens[i])
+                cand = max(0, el - int(r.dllm_config.block_size))
+                if cand:
+                    # Only already-allocated positions can be carried; a
+                    # mismatch means holdback and allocator disagree.
+                    allocated = (
+                        getattr(getattr(r, "kv", None), "kv_allocated_len", 0) or 0
+                    )
+                    pl = int(batch.prefix_lens[i])
+                    if pl + cand > allocated:
+                        raise RuntimeError(
+                            "dLLM commit fusion: cannot carry "
+                            f"{cand} positions from {pl}: the request has only "
+                            f"{allocated} tokens of KV allocated. The prefix "
+                            "holdback and the extend length disagree."
+                        )
+                    lead_i = cand
+            reuse_lead.append(lead_i)
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
@@ -315,7 +342,7 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
-    if reuse_kv is not None and any(reuse_kv):
+    if reuse_kv is not None and (any(reuse_kv) or any(reuse_lead or [])):
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
             reuse_kv,
@@ -324,6 +351,7 @@ def alloc_for_extend(
             extend_lens_cpu,
             req_pool_indices_device,
             alloc_page_size,
+            reuse_lead,
         )
     elif alloc_page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
@@ -388,9 +416,20 @@ def _alloc_extend_loc_with_kv_reuse(
     extend_lens_cpu: torch.Tensor,
     req_pool_indices_device: torch.Tensor,
     alloc_page_size: int,
+    reuse_lead: Optional[list[int]] = None,
 ) -> torch.Tensor:
     device = batch.device
     req_to_token = batch.req_to_token_pool.req_to_token
+    # reuse_lead[i]: leading extend positions that already own KV slots.
+    # reuse_kv[i] is the all-or-nothing FDFO case (lead == extend_len).
+    lead = list(reuse_lead or [0] * len(reuse_kv))
+    if any(lead) and alloc_page_size != 1:
+        # The paged branch below assumes all-or-nothing reuse per request.
+        raise RuntimeError(
+            f"dLLM commit fusion: partial KV reuse is not implemented for "
+            f"page_size={alloc_page_size} (only 1). The carried block and the "
+            "canvas would need separate page accounting."
+        )
 
     for i, req in enumerate(batch.reqs):
         if not reuse_kv[i]:
@@ -404,7 +443,8 @@ def _alloc_extend_loc_with_kv_reuse(
             raise RuntimeError("dLLM FDFO retained KV is missing.")
 
     alloc_extend_lens = [
-        0 if reuse_kv[i] else int(extend_lens_cpu[i]) for i in range(len(reuse_kv))
+        0 if reuse_kv[i] else max(0, int(extend_lens_cpu[i]) - lead[i])
+        for i in range(len(reuse_kv))
     ]
     alloc_extend_num_tokens = sum(alloc_extend_lens)
 
@@ -453,6 +493,30 @@ def _alloc_extend_loc_with_kv_reuse(
                     reuse_dtype
                 )
             )
+        elif lead[i]:
+            # Partial reuse: carried slots, then fresh canvas slots, in window
+            # order (out_cache_loc is positional).
+            req_idx = int(req_pool_indices_cpu[i])
+            k = lead[i]
+            if k > extend_len:
+                raise RuntimeError(
+                    f"dLLM fusion: carried length {k} exceeds the extend "
+                    f"({extend_len}) for req slot {req_idx}"
+                )
+            carried = req_to_token[req_idx, prefix_len : prefix_len + k]
+            # Unallocated req_to_token entries read as slot 0 (not negative);
+            # cheap backstop to the kv_allocated_len check above.
+            if k > 1 and bool((carried == 0).all()):
+                raise RuntimeError(
+                    "dLLM fusion: every carried KV index is slot 0 over "
+                    f"[{prefix_len}, {prefix_len + k}) for req slot {req_idx} "
+                    "-- these positions were never allocated."
+                )
+            parts.append(carried.to(reuse_dtype))
+            rest = extend_len - k
+            if rest:
+                parts.append(fresh_slots[fresh_ptr : fresh_ptr + rest])
+                fresh_ptr += rest
         else:
             parts.append(fresh_slots[fresh_ptr : fresh_ptr + extend_len])
             fresh_ptr += extend_len

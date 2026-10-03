@@ -1,0 +1,22 @@
+# DuoBlock decode config, NFE 8, commit fusion on (requires --max-running-requests 1).
+steps_per_block: 8
+max_steps_per_block: 64
+greedy: false
+temperature: 1.0
+temp_anneal: true
+temp_start: 0.8
+temp_end: 0.4
+temp_schedule: linear
+terminal_sigma_floor: 0.7
+kappa: 1.0
+top_p: 1.0
+top_k: 0
+top_p_site: belief
+self_cond: true
+noise_removal: ancestral
+adaptive_stop: false
+eps: 0.001
+schedule: rho
+rho: 0.3
+use_float64: true
+commit_fusion: true

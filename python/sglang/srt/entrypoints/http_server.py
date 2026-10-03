@@ -66,6 +66,7 @@ from fastapi.routing import APIRoute
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.dllm.params import dllm_graph_flag
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
     AnthropicMessagesRequest,
@@ -2285,6 +2286,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            _dllm_block_graph_warmup(server_args, url, headers, ssl_verify)
             # Skip server_status update for Rust server
             if not envs.SGLANG_RUST_SERVER.get():
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -2329,6 +2331,114 @@ def _execute_server_warmup(server_args: ServerArgs):
         return False
 
     return success
+
+
+def _dllm_block_graph_warmup(server_args: ServerArgs, url, headers, ssl_verify) -> None:
+    """Capture every dLLM block graph before the server reports Up.
+
+    A block graph records on the second sighting of its key, so each captured
+    decode batch size (up to the running cap) runs twice, per DP rank. Runs while
+    /health still reports Starting. Best effort: a failure leaves capture to live
+    traffic. The sampled blocks advance the global RNG, so outputs under a fixed
+    --random-seed differ from a run without the warmup.
+    """
+    if (
+        server_args.dllm_algorithm is None
+        or not dllm_graph_flag(
+            envs.SGLANG_DLLM_ENABLE_BLOCK_GRAPH, server_args.dllm_algorithm
+        )
+        or envs.SGLANG_RUST_SERVER.get()
+    ):
+        return
+    # DP attention runs one batch across ranks, so no rank sees the intended size.
+    if server_args.enable_dp_attention:
+        logger.info("dLLM block graph warmup skipped (DP attention)")
+        return
+    if server_args.tokenizer_worker_num <= 1:
+        _dllm_run_block_graph_warmup(server_args, url, headers, ssl_verify)
+        return
+    # Every tokenizer worker runs this warmup: the first captures, the rest wait
+    # on the lock so none reports Up before the graphs exist.
+    import fcntl
+
+    import psutil
+
+    main_pid = get_main_process_id()
+    stem = os.path.join(
+        tempfile.gettempdir(),
+        f"sglang_dllm_block_warmup_{main_pid}_{int(psutil.Process(main_pid).create_time())}",
+    )
+    with open(stem + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(stem + ".done"):
+            return
+        # A failed warmup is not marked done, so the next worker retries it.
+        if _dllm_run_block_graph_warmup(server_args, url, headers, ssl_verify):
+            open(stem + ".done", "w").close()
+
+
+def _dllm_run_block_graph_warmup(
+    server_args: ServerArgs, url, headers, ssl_verify
+) -> bool:
+    try:
+        from sglang.srt.dllm.config import DllmConfig
+
+        block = int(DllmConfig.from_server_args(server_args).block_size)
+        cap = server_args.max_running_requests
+        # The scheduler's memory-resolved cap; without it the sizes to warm are a guess.
+        info = requests.get(
+            url + "/server_info", headers=headers, timeout=30, verify=ssl_verify
+        )
+        if info.status_code != 200:
+            raise RuntimeError(f"/server_info returned HTTP {info.status_code}")
+        states = info.json().get("internal_states") or [{}]
+        cap = states[0].get("effective_max_running_requests_per_dp") or cap
+        sizes = sorted(
+            b
+            for b in (server_args.cuda_graph_config.decode.bs or [])
+            if cap is None or b <= cap
+        )
+        t0 = time.time()
+        # Plain DP splits a batch across ranks; pin each warmup batch to one rank.
+        ranks = list(range(server_args.dp_size)) if server_args.dp_size > 1 else [None]
+        # Greedy B=1 too: SGLang's own warmup and health checks are temperature 0.
+        runs = [(b, 1.0) for b in sizes for _ in range(2)] + [(1, 0.0)] * 2
+        for rank in ranks:
+            for bs, temperature in runs:
+                body = {
+                    "input_ids": [[10 + k for k in range(8)] for _ in range(bs)],
+                    "sampling_params": {
+                        "max_new_tokens": 3 * block,
+                        "temperature": temperature,
+                        "ignore_eos": True,
+                    },
+                }
+                if rank is not None:
+                    body["routed_dp_rank"] = rank
+                res = requests.post(
+                    url + "/generate",
+                    json=body,
+                    headers=headers,
+                    timeout=1800,
+                    verify=ssl_verify,
+                )
+                if res.status_code != 200:
+                    raise RuntimeError(
+                        f"rank={rank} bs={bs}: HTTP {res.status_code} {res.text[:200]}"
+                    )
+        logger.info(
+            "dLLM block graph warmup: batch sizes %s on %d DP rank(s) in %.1f s",
+            sizes,
+            len(ranks),
+            time.time() - t0,
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "dLLM block graph warmup failed (%s); graphs will be captured under traffic",
+            e,
+        )
+        return False
 
 
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):

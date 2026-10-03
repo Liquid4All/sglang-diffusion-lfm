@@ -558,6 +558,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.maybe_trace_cache_selection()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -592,6 +593,10 @@ class Scheduler(
 
         # Init diffusion LLM
         self.init_diffusion_llm()
+
+        # Refuse an unservable dLLM config at startup; must run after
+        # init_diffusion_llm() and after the tree cache and KV allocator exist.
+        self.validate_dllm_serving_config()
 
         self.init_metrics_reporter(tp_rank, pp_rank, dp_rank)
 
@@ -1101,6 +1106,19 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}="
                 f"{self.startup_available_gpu_memory_gb:.2f} GB"
             )
+
+    def maybe_trace_cache_selection(self) -> None:
+        """Log which prefix cache class was built, under the dLLM trace flag."""
+        if not envs.SGLANG_DLLM_PREFIX_TRACE.get():
+            return
+        logger.warning(
+            "dllm-cache-trace: tree_cache=%s disable_radix_cache=%s "
+            "is_chunk=%s is_hybrid_ssm=%s",
+            type(self.tree_cache).__name__,
+            self.disable_radix_cache,
+            getattr(self.tree_cache, "is_chunk_cache", lambda: None)(),
+            self.is_hybrid_ssm,
+        )
 
     def emit_metrics_constants(self) -> None:
         if not get_observability().enable_metrics:

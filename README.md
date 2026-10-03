@@ -21,12 +21,22 @@ upstream SGLang (`2e7c85da6`, August 2026). Model details, evaluation and citati
 
 ```bash
 git clone https://github.com/Liquid4All/sglang-diffusion-lfm && cd sglang-diffusion-lfm
-SGLANG_BUILD_RUST_EXTS=none pip install -e "python"     # NVIDIA
-# AMD (ROCm):
-mv python/pyproject_other.toml python/pyproject.toml && SGLANG_BUILD_RUST_EXTS=none pip install -e "python[all_hip]"
+SGLANG_BUILD_RUST_EXTS=none pip install -e "python"
 ```
 
 `SGLANG_BUILD_RUST_EXTS=none` skips SGLang's optional Rust extensions, which otherwise need a Rust toolchain.
+
+**AMD (ROCm).** Start from SGLang's ROCm image (`mi30x` for MI300X/MI325X, `mi35x` for MI350/MI355) and install this
+repository on top of it:
+
+```bash
+docker run -it --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size 16g \
+  -v ~/.cache/huggingface:/root/.cache/huggingface -p 30000:30000 lmsysorg/sglang:v0.5.17-rocm720-mi30x bash
+git clone https://github.com/Liquid4All/sglang-diffusion-lfm && cd sglang-diffusion-lfm
+SGLANG_BUILD_RUST_EXTS=none pip install -e "python" --no-deps
+```
+
+The serve scripts below set `SGLANG_USE_AITER=0`: the ROCm images enable AITER, which slows DuoBlock by about 30%.
 
 ## Serve
 

@@ -2,6 +2,8 @@
 # Single-request latency: one request at a time, commit fusion inside the whole-block graph.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+# The SGLang ROCm images enable AITER, which slows DuoBlock by ~30%; no effect on NVIDIA.
+export SGLANG_USE_AITER=${SGLANG_USE_AITER:-0}
 MODEL=${MODEL:-LiquidAI/lfm2.5-350m-diffusion-exp}
 DECODE=${DECODE:-decode_nfe8_fused.yaml}
 [ -f "$DECODE" ] || DECODE=$HERE/$DECODE  # a bare name is looked up next to this script

@@ -26,6 +26,8 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
+import copy
+import dataclasses
 import inspect
 import logging
 import os
@@ -43,6 +45,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.params import dllm_graph_flag
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -205,6 +208,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    # Class-level non-dLLM defaults: speculative subclasses share the capture
+    # loop but define their own __init__ without calling super().__init__().
+    dllm_widths: tuple = ()
+    is_dllm: bool = False
+    dllm_config = None
+    _dllm_sat_capturable: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -295,6 +305,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
+        self._capture_dllm_variant = None
+        self._dllm_replayed_variants: set = set()
+        self._dllm_conv_snapshot_refusals: set = set()
+        # Widths a dLLM generation forward can have, all captured; DllmConfig
+        # also sizes the shared logits buffer from them.
+        self.dllm_widths: tuple = (
+            () if self.dllm_config is None else self.dllm_config.decode_widths()
+        )
+        # Set only while capturing, so capture builds the variant's own shape.
+        self._capture_width = None
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             get_spec().speculative_num_steps
@@ -311,9 +331,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
         # Static capture width.
+        # Under commit fusion this is the maximum width; the per-forward width
+        # comes from _capture_width (capture) or the batch (replay).
         self.captured_req_width = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
         )
+        # decode_num_tokens_per_req reports one block; widen to the fused
+        # window, which sizes max_num_token, the registry buffers and buckets.
+        if self.dllm_widths and max(self.dllm_widths) > self.captured_req_width:
+            self.captured_req_width = max(self.dllm_widths)
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
@@ -435,6 +461,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface, replacing
         # populate_from_forward_batch on capture/replay paths.
+        self._dllm_sat_capturable = self._dllm_state_at_capturable()
         self.buffer_registry: CudaGraphBufferRegistry = build_decode_registry(
             device=self.device,
             max_bs=self.max_bs,
@@ -449,6 +476,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             enable_prefill_cp=self.enable_prefill_cp,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             dp_size=self.dp_size,
+            dllm_conditioning=self.is_dllm,
+            dllm_tensor_causality=(
+                self.is_dllm and envs.SGLANG_DLLM_ENABLE_TENSOR_CAUSALITY.get()
+            ),
+            dllm_selfcond_dim=self._dllm_selfcond_dim(),
+            dllm_adaln_dim=self._dllm_adaln_dim(),
+            dllm_adaln_dtype=self._dllm_adaln_dtype(),
+            dllm_conv_state_at=self._dllm_sat_capturable,
             source=self.buffers,
         )
 
@@ -567,6 +602,440 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "sparse"
         return "dense" if max_kv_len <= self.dsa_index_topk else "sparse"
 
+    def _dllm_width_of(self, forward_batch) -> int:
+        """Per-request query width of this batch (varies under commit fusion)."""
+        bs = getattr(forward_batch, "batch_size", 0) or 0
+        ids = getattr(forward_batch, "input_ids", None)
+        if bs and ids is not None:
+            n = ids.numel()
+            if n % bs == 0:
+                w = n // bs
+                if not self.dllm_widths or w in self.dllm_widths:
+                    return w
+        return self.captured_req_width
+
+    def _publish_dllm_width(self, width: int) -> None:
+        """Tell the attention backends which dLLM width is in play; graph metadata is
+        built without a ForwardBatch, but sets kv_lens = seq_lens - width."""
+        if not self.dllm_widths:
+            return
+        # Walk into hybrid wrappers (attn_backend_list), which have no width
+        # attribute of their own.
+        _mr = getattr(self, "model_runner", None)
+        stack = [
+            getattr(self, "attn_backend", None),
+            getattr(_mr, "attn_backend", None),
+        ]
+        # PD-multiplexed deployments run on decode_attn_backend_group members,
+        # which the `published` guard below would not notice being missed.
+        stack.extend(getattr(_mr, "decode_attn_backend_group", None) or ())
+        seen: set = set()
+        published = 0
+        while stack:
+            be = stack.pop()
+            if be is None or id(be) in seen:
+                continue
+            seen.add(id(be))
+            if hasattr(be, "_dllm_active_width"):
+                be._dllm_active_width = int(width)
+                published += 1
+            stack.extend(getattr(be, "attn_backend_list", None) or ())
+        if published == 0 and len(self.dllm_widths) > 1:
+            # Only fatal with several widths; with one, each backend's constant
+            # fallback is already correct.
+            raise RuntimeError(
+                "commit fusion is on (widths="
+                f"{self.dllm_widths}) but no attention backend accepted the "
+                "active dLLM width; every backend would fall back to a "
+                "constant width and build wrong attention metadata."
+            )
+
+    def _active_width(self, forward_batch=None) -> int:
+        """Width to build/replay at: the capture variant's, else the batch's."""
+        if self._capture_width is not None:
+            return self._capture_width
+        if forward_batch is not None:
+            return self._dllm_width_of(forward_batch)
+        return self.captured_req_width
+
+    def _dllm_capture_variants(self):
+        """Conditioning variants this deployment requests at replay, as
+        (causal_override, self_cond, clean_upto, save_kv, split, state_at)."""
+        if not self.is_dllm:
+            # Same arity as the dLLM variants; the capture loop unpacks it.
+            return [(None, None, 0, True, False, False)]
+        cond = self.dllm_config
+        acfg = getattr(cond, "algorithm_config", None) or {}
+        causals = [False]  # denoise / readout, always
+        # Under fusion only causal=False is reachable: there is no standalone
+        # commit forward, and the causal=None clean prompt never replays.
+        if not acfg.get("commit_fusion", False):
+            if not getattr(cond, "prefix_bidirectional", False):
+                causals.append(True)  # commit, token-causal prefix
+            # None = layer-default causality, taken by the exactly-block_size
+            # clean-prompt path (see DuoBlock.prepare_forward).
+            causals.append(None)
+        scs = [False]
+        if self._dllm_selfcond_dim() > 0 and bool(acfg.get("self_cond", True)):
+            scs.append(True)
+        # clean_upto determines the width (block_size + clean_upto): 0 is the
+        # narrow block, block_size the fused one.
+        blk = int(cond.block_size)
+        uptos = [0]
+        if acfg.get("commit_fusion", False):
+            uptos.append(blk)
+        out = []
+        for c in causals:
+            for sc in scs:
+                for u in uptos:
+                    if c is False:
+                        # denoise/readout never save; the bidirectional commit
+                        # (prefix_bidirectional / fusion) also has c False and saves.
+                        out.append((c, sc, u, False, False))
+                        if getattr(cond, "prefix_bidirectional", False) or acfg.get(
+                            "commit_fusion", False
+                        ):
+                            out.append((c, sc, u, True, False))
+                    else:
+                        out.append((c, sc, u, True, False))
+        # Split-prefix attention is baked into the graph; resolved per replay
+        # via TritonAttnBackend.dllm_split_wanted. Only denoise/readout takes it.
+        if self._dllm_split_enabled():
+            out.extend(
+                (c, sc, u, save, True)
+                for (c, sc, u, save, _) in list(out)
+                if c is False and not save and not u
+            )
+        # The padded prompt prefill: clean, layer-default causal, persisting,
+        # block width. Needed as a base for its state-point twin below.
+        if (
+            self._dllm_graph_prompt_prefill()
+            and (None, False, 0, True, False) not in out
+        ):
+            out.append((None, False, 0, True, False))
+        out = [v + (False,) for v in out]
+        # Conv state point (dllm_conv_state_at): only state-writing variants,
+        # since gated_sconv refuses a state point with write_state=False.
+        if self._dllm_sat_capturable:
+            out.extend(
+                (c, sc, u, True, False, True)
+                for (c, sc, u, save, split, _) in list(out)
+                if save and not split
+            )
+        return out
+
+    def _dllm_graph_prompt_prefill(self) -> bool:
+        return dllm_graph_flag(
+            envs.SGLANG_DLLM_ENABLE_GRAPH_PROMPT_PREFILL,
+            self.dllm_config.algorithm if self.is_dllm else None,
+        )
+
+    def _dllm_state_at_capturable(self) -> bool:
+        """Whether state-point forwards are captured: needs a consumer and fused
+        gated_sconv on every short conv (the unfused path syncs to host)."""
+        if not self.is_dllm:
+            return False
+        acfg = getattr(self.dllm_config, "algorithm_config", None) or {}
+        if not (
+            acfg.get("ar_verify", False)
+            or acfg.get("commit_fusion", False)
+            or self._dllm_graph_prompt_prefill()
+        ):
+            return False
+        # Capture time: re-walk the tree so the per-forward cached check starts true.
+        return self._dllm_fused_conv_covers_all(refresh=True)
+
+    def _dllm_conv_state_snapshot(self, attn_backend, static_fb):
+        """This batch's conv-state slots for every layer, or None without short conv."""
+        if not hasattr(attn_backend, "conv_state_pool"):
+            return None
+        lids = list(
+            getattr(self.model_runner.model.config, "linear_layer_ids", []) or []
+        )
+        if not lids:
+            return None
+        pool = attn_backend.conv_state_pool()
+        idx = attn_backend.conv_state_metadata(lids[0], static_fb).cache_indices
+        return pool, idx, pool[:, idx].clone()
+
+    @staticmethod
+    def _dllm_conv_state_restore(snap) -> None:
+        if snap is not None:
+            pool, idx, saved = snap
+            pool[:, idx] = saved
+
+    # Per-step state a backend reads while a forward runs (besides forward_metadata).
+    _DLLM_STEP_ATTRS = (
+        "_seq_lens_cpu",
+        "_has_initial_state",
+        "_cache_indices",
+        "_slot_ids_cpu",
+        "_has_prefix_cpu",
+    )
+    # Filled by the narrow plan identically to the wide one, or (kv_indices, at
+    # batch size 1) as a superset whose leading entries are the wide prefix.
+    _DLLM_SHARED_OK = frozenset({"kv_indices", "mamba_cache_indices", "_cache_indices"})
+
+    def _dllm_leaf_backends(self, attn_backend) -> list:
+        out, stack, seen = [], [attn_backend], set()
+        while stack:
+            be = stack.pop()
+            if be is None or id(be) in seen:
+                continue
+            seen.add(id(be))
+            if hasattr(be, "forward_metadata"):
+                out.append(be)
+            stack.extend(getattr(be, "attn_backend_list", None) or ())
+        return out
+
+    def _dllm_two_width_ok(self, attn_backend, bs: int) -> bool:
+        """Whether a width-changing block can hold both attention plans at once:
+        batch size 1, no unified-pool translation and no sliding window."""
+        if bs != 1:
+            return False
+        for be in self._dllm_leaf_backends(attn_backend):
+            if getattr(be, "_translate_kv_loc", None) is not None:
+                return False
+            if (getattr(be, "sliding_window_size", None) or 0) > 0:
+                return False
+        return True
+
+    def _dllm_step_state(self, be) -> dict:
+        st = {"forward_metadata": be.forward_metadata}
+        for a in self._DLLM_STEP_ATTRS:
+            if hasattr(be, a):
+                st[a] = getattr(be, a)
+        return st
+
+    def _dllm_private_copy(self, st: dict, copies: list) -> dict:
+        """This plan with every width-dependent tensor moved to a private buffer,
+        so the other width's plan can refill the shared ones."""
+
+        def own(name, v):
+            if not torch.is_tensor(v) or name in self._DLLM_SHARED_OK:
+                return v
+            if v.numel() > 65536:
+                raise ValueError(
+                    f"{name} has {v.numel()} elements, too large to copy per replay"
+                )
+            p = v.clone()
+            copies.append((p, v))
+            return p
+
+        out = {}
+        for a, v in st.items():
+            if a == "forward_metadata" and dataclasses.is_dataclass(v):
+                m = copy.copy(v)
+                for f in dataclasses.fields(m):
+                    setattr(m, f.name, own(f.name, getattr(m, f.name)))
+                out[a] = m
+            else:
+                out[a] = own(a, v)
+        return out
+
+    @staticmethod
+    def _dllm_narrow_plan_view(fb, narrow: int):
+        """A view of a batch-size-1 wide batch covering its last ``narrow`` tokens,
+        for planners that read the width off input_ids."""
+        c = int(fb.input_ids.numel()) - narrow
+        v = copy.copy(fb)
+        for name in ("input_ids", "positions", "out_cache_loc"):
+            t = getattr(fb, name, None)
+            if t is not None:
+                setattr(v, name, t[c:])
+        return v
+
+    def _dllm_capture_two_width_plan(
+        self, attn_backend, static_fb, wide: int, narrow: int
+    ):
+        """Capture-form plans for both widths. The wide plan (just made) moves to
+        private buffers; the narrow plan stays in the shared ones."""
+        leaves = self._dllm_leaf_backends(attn_backend)
+        copies: list = []
+        wide_st = [
+            self._dllm_private_copy(self._dllm_step_state(be), copies) for be in leaves
+        ]
+        self._publish_dllm_width(narrow)
+        attn_backend.init_forward_metadata_out_graph(
+            self._dllm_narrow_plan_view(static_fb, narrow), in_capture=True
+        )
+        narrow_st = [self._dllm_step_state(be) for be in leaves]
+        self._publish_dllm_width(wide)
+        return dict(
+            leaves=leaves,
+            copies=copies,
+            wide=wide,
+            narrow=narrow,
+            state={wide: wide_st, narrow: narrow_st},
+        )
+
+    def _dllm_install_width(self, plan, width: int) -> None:
+        self._publish_dllm_width(width)
+        for be, st in zip(plan["leaves"], plan["state"][width]):
+            for a, v in st.items():
+                setattr(be, a, v)
+
+    def _dllm_refresh_two_width_plan(self, plan, attn_backend) -> None:
+        """Before a replay, after load_batch planned the wide width into the
+        shared buffers: copy it to the private ones, then plan the narrow width."""
+        for p, src in plan["copies"]:
+            p.copy_(src)
+        self._publish_dllm_width(plan["narrow"])
+        attn_backend.init_forward_metadata_out_graph(
+            self._dllm_narrow_plan_view(self._dllm_last_fb_view, plan["narrow"])
+        )
+        self._publish_dllm_width(plan["wide"])
+
+    def _dllm_fused_conv_covers_all(self, refresh: bool = False) -> bool:
+        from sglang.srt.dllm.kernels import gated_sconv
+
+        return gated_sconv.covers_all(self.model_runner.model, refresh=refresh)
+
+    def _dllm_full_attn_backend(self):
+        be = getattr(self.model_runner, "attn_backend", None)
+        return getattr(be, "full_attn_backend", be)
+
+    def _dllm_split_enabled(self) -> bool:
+        return bool(getattr(self._dllm_full_attn_backend(), "use_dllm_splitkv", False))
+
+    def _dllm_split_for(self, forward_batch: ForwardBatch) -> bool:
+        if not self._dllm_split_enabled():
+            return False
+        fn = getattr(self._dllm_full_attn_backend(), "dllm_split_wanted", None)
+        return bool(fn(forward_batch)) if fn is not None else False
+
+    def _dllm_adaln_dim(self) -> int:
+        """3*hidden when the model exposes adaln_rows (adaLN conditioning), else 0."""
+        m = self.model_runner.model
+        if not self.is_dllm or not hasattr(m, "adaln_rows"):
+            return 0
+        dim = int(m.adaln_dim())
+        logger.warning("dLLM adaLN graph slot: %d columns", dim)
+        return dim
+
+    def _dllm_adaln_dtype(self) -> torch.dtype:
+        m = self.model_runner.model
+        fn = getattr(m, "adaln_dtype", None)
+        return fn() if fn is not None else torch.bfloat16
+
+    def _dllm_selfcond_dim(self) -> int:
+        """Self-conditioning hidden width, or 0; read from the config because the
+        buffer must exist before the first forward."""
+        if not self.is_dllm:
+            return 0
+        cfg = self.model_runner.model_config.hf_config
+        if not getattr(cfg, "self_conditioning", False):
+            return 0
+        return int(getattr(cfg, "hidden_size", 0))
+
+    @staticmethod
+    def _dllm_variant_label(
+        causal, sc, clean_upto=None, save_kv=True, split=False, state_at=False
+    ) -> str:
+        """The single place a conditioning variant becomes a graph-key string;
+        capture and replay must agree or every forward silently runs eager."""
+        base = f"dllm-c{'def' if causal is None else int(causal)}-s{int(sc)}"
+        if clean_upto:
+            base = f"{base}-u{int(clean_upto)}"
+        if not save_kv:
+            base = f"{base}-nokv"
+        if split:
+            base = f"{base}-split"
+        # gated_sconv's STATE_AT is a constexpr baked at capture.
+        return f"{base}-sat" if state_at else base
+
+    def _compose_capture_variant_label(self, variant_label):
+        """Capture-side twin of ``_resolve_variant_label``."""
+        v = getattr(self, "_capture_dllm_variant", None)
+        if not self.is_dllm or v is None:
+            return variant_label
+        dllm = self._dllm_variant_label(*v)
+        return dllm if variant_label is None else f"{variant_label}|{dllm}"
+
+    def _dllm_can_snapshot_conv(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this runner can take the block's conv snapshot itself; a refusal
+        runs that forward eager and each distinct reason is logged once."""
+        if not envs.SGLANG_DLLM_ENABLE_GRAPH_FIRST_FORWARD.get():
+            return False
+        # The empty list the algorithm pre-creates on a block's first forward.
+        snap = forward_batch.dllm_conv_snapshot
+        if not isinstance(snap, list) or snap:
+            reason = "no empty dllm_conv_snapshot carrier on the batch"
+        elif not self._dllm_load_batch_will_plan(forward_batch):
+            reason = (
+                "load_batch takes a pre-planned shortcut for this batch -- a "
+                "path the conv snapshot has never been exercised on"
+            )
+        elif not hasattr(self._replay_attn_backend(), "conv_state_metadata"):
+            reason = (
+                f"{type(self._replay_attn_backend()).__name__} exposes no "
+                "conv_state_metadata"
+            )
+        else:
+            return True
+        if reason not in self._dllm_conv_snapshot_refusals:
+            self._dllm_conv_snapshot_refusals.add(reason)
+            logger.warning(
+                "dLLM: first forward of a block stays EAGER (%s). The graphed "
+                "first forward is enabled but not usable here, so this block "
+                "keeps the slower pre-change path.",
+                reason,
+            )
+        return False
+
+    @staticmethod
+    def _dllm_load_batch_will_plan(forward_batch: ForwardBatch) -> bool:
+        """Whether ``load_batch`` takes its full path; the conv snapshot is only
+        validated there, not on the pre-planned shortcuts."""
+        return bool(
+            forward_batch.needs_forward_metadata_init()
+            and not getattr(forward_batch, "attn_metadata_ready", False)
+        )
+
+    def _dllm_capture_conv_snapshot(self, forward_batch: ForwardBatch) -> None:
+        """Record the pre-block short-conv state outside the graph, in place of the
+        model's own snapshot. Must run after load_batch and the deferred mamba ops."""
+        snap = forward_batch.dllm_conv_snapshot
+        backend = self._replay_attn_backend()
+        lids = list(self.model_runner.model_config.hf_config.linear_layer_ids)
+        # Raw rows only: padded rows map to a sentinel or slot 0, which this
+        # batch does not own.
+        if hasattr(backend, "conv_state_pool") and lids:
+            # One pool-level entry, as the model writer produces.
+            meta = backend.conv_state_metadata(lids[0], forward_batch)
+            pool = backend.conv_state_pool()
+            idx = meta.cache_indices[: self.raw_bs]
+            snap.append((pool, idx, pool[:, idx].clone()))
+            return
+        for lid in lids:
+            meta = backend.conv_state_metadata(lid, forward_batch)
+            cs = meta.layer_cache.conv[0]
+            idx = meta.cache_indices[: self.raw_bs]
+            snap.append((cs, idx, cs[idx].clone()))
+
+    def _resolve_dllm_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+        """Which captured conditioning variant this forward needs; replaying the
+        wrong one is silently wrong."""
+        if not self.is_dllm:
+            return None
+        return self._dllm_variant_label(
+            forward_batch.dllm_causal_override,
+            forward_batch.dllm_selfcond is not None,
+            # Must be a declared field to survive the replace()-copy.
+            forward_batch.dllm_clean_upto,
+            save_kv=forward_batch.dllm_save_kv,
+            split=self._dllm_split_for(forward_batch),
+            state_at=forward_batch.dllm_conv_state_at is not None,
+        )
+
+    def _resolve_variant_label(self, forward_batch: ForwardBatch):
+        """Compose every independent graph-variant axis into one label."""
+        lora = self._resolve_lora_variant(forward_batch)
+        dllm = self._resolve_dllm_variant(forward_batch)
+        if dllm is None:
+            return lora
+        return dllm if lora is None else f"{lora}|{dllm}"
+
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not getattr(self, "record_nolora_graph", False):
             return None
@@ -648,6 +1117,58 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        if self.is_dllm:
+            # Diagnostic: capture but never replay, to separate state left by
+            # capture from replay-side errors.
+            if envs.SGLANG_DLLM_GRAPH_CAPTURE_ONLY.get():
+                return False
+
+            # A clean prompt prefill of exactly block_size tokens passes the
+            # width check below but must not replay a block graph.
+            if forward_batch.dllm_prompt_prefill:
+                return False
+
+            # A state-point forward needs a captured -sat variant and fused
+            # gated_sconv on every short conv (re-checked: weight updates reinstall).
+            if forward_batch.dllm_conv_state_at is not None and not (
+                self.buffer_registry.has_slot("dllm_conv_state_at")
+                and self._dllm_fused_conv_covers_all()
+            ):
+                return False
+
+            # A block's first forward must record the pre-block conv state, so it
+            # is graphable only if the runner can take that snapshot itself.
+            if forward_batch.dllm_conv_capture:
+                if not self._dllm_can_snapshot_conv(forward_batch):
+                    return False
+            # The adaLN slot is bound at capture; a forward without a base
+            # would read stale rows, so run it eager.
+            if (
+                self.buffer_registry.has_slot("dllm_adaln_base")
+                and forward_batch.dllm_adaln_base is None
+            ):
+                if not getattr(self, "_dllm_adaln_refused_logged", False):
+                    self._dllm_adaln_refused_logged = True
+                    logger.warning(
+                        "dLLM graph refused: %s forward (phase=%s, %d tokens) "
+                        "carries no dllm_adaln_base while the model conditions "
+                        "on adaLN; running eager. Expected for the prompt "
+                        "prefill, which is never graphed; a generation forward "
+                        "here means the algorithm did not set it.",
+                        forward_batch.forward_mode.name,
+                        forward_batch.dllm_phase,
+                        int(forward_batch.input_ids.numel()),
+                    )
+                return False
+
+            # Only uniform windows of a captured width replay; decided here since the
+            # backends' metadata hooks run after the runner has committed to a replay.
+            _n = forward_batch.input_ids.numel()
+            _bs = forward_batch.batch_size
+            _widths = self.dllm_widths or (self.captured_req_width,)
+            if _bs <= 0 or _n % _bs or (_n // _bs) not in _widths:
+                return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -677,7 +1198,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
-            variant_label=self._resolve_lora_variant(forward_batch),
+            variant_label=self._resolve_variant_label(forward_batch),
         )
 
         is_bs_supported = (
@@ -685,6 +1206,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
+        if self.is_dllm and not self.disable_padding:
+            # With padding the check above covers only batch size; also require a
+            # captured variant (not the full key, which uses the raw bs).
+            _captured = {
+                self._dllm_variant_label(*v) for v in self._dllm_capture_variants()
+            }
+            if self._resolve_dllm_variant(forward_batch) not in _captured:
+                is_bs_supported = False
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -853,7 +1382,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         bs = size
         buffers: DecodeInputBuffers = self.buffers
         if num_tokens is None:
-            num_tokens = bs * self.captured_req_width
+            num_tokens = bs * self._active_width()
 
         # Registry-owned FB-shared slots come through the registry (which
         # shares physical storage with self.buffers via source=...); the rest
@@ -981,6 +1510,55 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
+        # Block-diffusion conditioning for this captured variant, baked into
+        # the graph; _resolve_dllm_variant keys replay on the same axes.
+        if self.is_dllm:
+            causal, sc, upto, save_kv, split, sat = getattr(
+                self, "_capture_dllm_variant", None
+            ) or (None, None, 0, True, False, False)
+            forward_batch.dllm_causal_override = causal
+            forward_batch.dllm_save_kv = save_kv
+            # Baked, so the backend must not re-decide from the synthetic lengths.
+            forward_batch.dllm_split_attn = bool(split)
+            # PER_REQ_CAUSAL is a constexpr resolved from whether this tensor
+            # is None, so the capture batch must carry it.
+            if self.buffer_registry.has_slot("dllm_causal_rows"):
+                _causal_rows = self.buffer_registry.get_slot("dllm_causal_rows").buffer[
+                    :bs
+                ]
+                _causal_rows.fill_(int(bool(causal)))
+                forward_batch.dllm_causal_rows = _causal_rows
+            # clean_upto is a constexpr in the extend kernel; 0 on a fused
+            # variant would record a fully bidirectional mask.
+            forward_batch.dllm_clean_upto = int(upto)
+            # STATE_AT is a constexpr, so bind the slot only for -sat variants,
+            # filled to the full window.
+            if sat and self.buffer_registry.has_slot("dllm_conv_state_at"):
+                _sat = self.buffer_registry.get_slot("dllm_conv_state_at").buffer[:bs]
+                _sat.fill_(int(self._active_width()))
+                forward_batch.dllm_conv_state_at = _sat
+            else:
+                forward_batch.dllm_conv_state_at = None
+            forward_batch.dllm_sigma = self.buffer_registry.get_slot(
+                "dllm_sigma"
+            ).buffer[:num_tokens]
+            if self.buffer_registry.has_slot("dllm_adaln_base"):
+                forward_batch.dllm_adaln_base = self.buffer_registry.get_slot(
+                    "dllm_adaln_base"
+                ).buffer[:num_tokens]
+            if sc and self.buffer_registry.has_slot("dllm_selfcond"):
+                forward_batch.dllm_selfcond = self.buffer_registry.get_slot(
+                    "dllm_selfcond"
+                ).buffer[:num_tokens]
+            else:
+                forward_batch.dllm_selfcond = None
+            # The self-conditioning gate is read behind a Python `if`, so bind
+            # it at capture on every variant; its pad of 1.0 is a no-op.
+            if self.buffer_registry.has_slot("dllm_selfcond_pos_mask"):
+                forward_batch.dllm_selfcond_pos_mask = self.buffer_registry.get_slot(
+                    "dllm_selfcond_pos_mask"
+                ).buffer[:num_tokens]
+
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
@@ -1082,6 +1660,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variants = (
             ["dense", "sparse"] if getattr(self, "dsa_dual_graph", False) else [None]
         )
+        dllm_variants = self._dllm_capture_variants()
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1095,23 +1674,177 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
-                for dsa_variant in dsa_variants:
-                    _set_capture_dsa_variant(dsa_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        if dsa_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
-                            )
-                        else:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
-                            )
+                for (
+                    dllm_causal,
+                    dllm_sc,
+                    dllm_upto,
+                    dllm_save,
+                    dllm_split,
+                    dllm_sat,
+                ) in dllm_variants:
+                    self._capture_dllm_variant = (
+                        dllm_causal,
+                        dllm_sc,
+                        dllm_upto,
+                        dllm_save,
+                        dllm_split,
+                        dllm_sat,
+                    )
+                    # width = block_size + clean_upto.
+                    self._capture_width = (
+                        None
+                        if not self.dllm_widths
+                        else self.dllm_widths[0] + int(dllm_upto)
+                    )
+                    if self._capture_width is not None:
+                        self._publish_dllm_width(self._capture_width)
+                    for dsa_variant in dsa_variants:
+                        _set_capture_dsa_variant(dsa_variant)
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self._active_width(),
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            if dsa_variant is None:
+                                self.capture_one_shape(
+                                    bs, forward, stream_idx, variant_label
+                                )
+                            else:
+                                self.capture_one_shape(
+                                    bs, forward, stream_idx, variant_label, dsa_variant
+                                )
         _set_capture_dsa_variant(None)
+        self._capture_dllm_variant = None
+        self._capture_width = None
+
+        if self.is_dllm:
+            # Capture warmups dirty conv state at the dummy slots; safe to wipe
+            # since this runs at startup before anything is served.
+            hook = getattr(
+                self.model_runner.attn_backend, "on_after_cuda_graph_warmup", None
+            )
+            if hook is not None:
+                cleared = hook()
+                logger.warning(
+                    "dLLM: cleared conv/mamba state dirtied by graph capture "
+                    "(slots=%s)",
+                    cleared,
+                )
+
+    def run_dllm_block(
+        self,
+        forward_batch: ForwardBatch,
+        key_extra,
+        loop_fn,
+        narrow_width: Optional[int] = None,
+    ):
+        """Run a whole block-diffusion block (forwards and sampler steps) as one graph.
+
+        Captures on the first sighting of ``key_extra``; returns the last forward's
+        LogitsProcessorOutput, or None if ineligible. ``loop_fn`` must start from a
+        fresh state each call (two warmups and one recording).
+        ``narrow_width`` is the width of forwards 1..N when it differs from forward
+        0's; both attention plans are then held at once. No post-warmup hook: the
+        conv backend's zeroes every slot, which is unsafe mid-serving.
+        """
+        if not self.is_dllm:
+            return None
+        bs = forward_batch.batch_size
+        width = self._dllm_width_of(forward_batch)
+        num_tokens = bs * width
+        if bs not in self.capture_bs or num_tokens != int(
+            forward_batch.input_ids.numel()
+        ):
+            return None
+        if narrow_width == width:
+            narrow_width = None
+        if narrow_width is not None and not self._dllm_two_width_ok(
+            self.attn_backend, bs
+        ):
+            return None
+        label = "dllm-block-" + "-".join(str(x) for x in key_extra)
+        key = self._make_graph_key(
+            self._capture_graph_size(bs=bs, num_tokens=num_tokens), None, label, None
+        )
+        cache = getattr(self, "_dllm_block_static", None)
+        if cache is None:
+            cache = self._dllm_block_static = {}
+        if key not in cache:
+            cache[key] = self.capture_prepare(
+                bs, stream_idx=None, num_tokens=num_tokens
+            )
+        static_fb, attn_backend, _pp = cache[key]
+        plans = self.__dict__.setdefault("_dllm_block_two_width", {})
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
+            # this block's inputs -> slots, attention plan out of graph
+            self._dllm_last_fb_view = None
+            self.load_batch(forward_batch)
+            if narrow_width is not None and self._dllm_last_fb_view is None:
+                return None  # a pre-planned batch; no replay view to plan the narrow width on
+            model = self.model_runner.model
+
+            def run_forward(fb):
+                plan = plans.get(key)
+                if plan is not None:
+                    self._dllm_install_width(plan, int(fb.input_ids.numel()) // bs)
+                attn_backend.init_forward_metadata_in_graph(fb)
+                set_is_extend_in_batch(False)
+                return model.forward(fb.input_ids, fb.positions, fb)
+
+            if not self.backend.can_run(static_fb, key):
+                logger.warning(
+                    "dLLM block graph: capturing %s (%d tokens)", label, num_tokens
+                )
+                # Warmups run eagerly, so the plan must be in capture form.
+                attn_backend.init_forward_metadata_out_graph(static_fb, in_capture=True)
+                if narrow_width is not None:
+                    try:
+                        plans[key] = self._dllm_capture_two_width_plan(
+                            attn_backend, static_fb, width, narrow_width
+                        )
+                    except ValueError as e:
+                        logger.warning(
+                            "dLLM block graph: not capturing %s: %s", label, e
+                        )
+                        return None
+                # Warmups consume RNG draws and overwrite this request's conv
+                # state; restore both before the first real replay.
+                rng = torch.cuda.get_rng_state()
+                conv = self._dllm_conv_state_snapshot(attn_backend, static_fb)
+                self.backend.capture_one(
+                    key,
+                    lambda: loop_fn(static_fb, run_forward),
+                    capture_inputs=None,
+                    post_warmup_hook=None,
+                )
+                self._dllm_conv_state_restore(conv)
+                torch.cuda.set_rng_state(rng)
+                # Warmups denoised the slot canvas in place; reload the inputs.
+                self.load_batch(forward_batch)
+            plan = plans.get(key)
+            if plan is not None:
+                self._dllm_refresh_two_width_plan(plan, attn_backend)
+            out = self.backend.replay(key, static_fb)
+            if plan is not None:
+                self._dllm_install_width(plan, width)
+            logged = self.__dict__.setdefault("_dllm_block_replay_logged", set())
+            if key not in logged:
+                logged.add(key)
+                logger.warning("dLLM block graph: replayed %s", label)
+        # the final canvas lives in the input_ids slot; hand it to the live batch
+        forward_batch.input_ids.copy_(static_fb.input_ids[: self.raw_num_token])
+        forward_batch.dllm_graph_replayed = True
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            full_logits=(
+                out.full_logits[: self.raw_num_token]
+                if out.full_logits is not None
+                else None
+            ),
+            hidden_states=None,
+            customized_info=getattr(out, "customized_info", None),
+        )
 
     def capture_one_shape(
         self,
@@ -1121,7 +1854,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label: Optional[str] = None,
         dsa_variant: Optional[str] = None,
     ):
-        num_tokens = size * self.captured_req_width
+        num_tokens = size * self._active_width()
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
@@ -1207,7 +1940,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 shape_key = self._make_graph_key(
                     self._capture_graph_size(bs=bs, num_tokens=num_tokens),
                     stream_idx,
-                    variant_label,
+                    # composed (lora | dllm) label, matching replay's lookup
+                    self._compose_capture_variant_label(variant_label),
                     dsa_variant,
                 )
                 post_warmup_hook = getattr(
@@ -1256,7 +1990,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._ragged_graph_size
                 if is_ragged
                 else self._capture_graph_size(
-                    bs=self.bs, num_tokens=self.bs * self.captured_req_width
+                    bs=self.bs,
+                    num_tokens=self.bs * self._active_width(forward_batch),
                 )
             )
             if is_ragged:
@@ -1276,7 +2011,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-            variant_label = self._resolve_lora_variant(forward_batch)
+            variant_label = self._resolve_variant_label(forward_batch)
             dsa_variant = self._resolve_dsa_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
@@ -1304,13 +2039,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens = graph_size_key
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
-            raw_num_token = raw_bs * self.captured_req_width
+            raw_num_token = raw_bs * self._active_width(forward_batch)
+            self._publish_dllm_width(self._active_width(forward_batch))
             if self.require_mlp_tp_gather:
                 max_batch_size = self._max_dp_batch_size(forward_batch)
                 bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
             else:
                 bs = self._pad_to_bucket(raw_bs, self.capture_bs)
-            padded_num_tokens = bs * self.captured_req_width
+            padded_num_tokens = bs * self._active_width(forward_batch)
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens
             )
@@ -1358,7 +2094,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_out_graph(fb_view)
+        # attn_metadata_ready skips only the plan; fill_from above has
+        # already refreshed the per-step dLLM conditioning.
+        if not getattr(forward_batch, "attn_metadata_ready", False):
+            attn_backend.init_forward_metadata_out_graph(fb_view)
+        self._dllm_last_fb_view = fb_view
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
@@ -1369,7 +2109,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._resolve_variant_label(forward_batch)
         dsa_variant = self._resolve_dsa_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
@@ -1394,6 +2134,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            if forward_batch.dllm_conv_capture:
+                # Must follow load_batch, which refreshes the slot mapping.
+                self._dllm_capture_conv_snapshot(forward_batch)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
@@ -1411,6 +2154,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            if self.is_dllm:
+                # Log each variant's first replay, since a capture/replay key
+                # mismatch silently falls back to eager.
+                _k = self._replay_graph_key.variant_label
+                if _k not in self._dllm_replayed_variants:
+                    self._dllm_replayed_variants.add(_k)
+                    logger.warning(
+                        # WARNING so it shows at the common log_level=warning.
+                        "dLLM graph REPLAY: variant=%s size=%s (captured "
+                        "variants: %s)",
+                        _k,
+                        self._replay_graph_key.size,
+                        sorted(
+                            self._dllm_variant_label(*v)
+                            for v in self._dllm_capture_variants()
+                        ),
+                    )
+            # Lets the algorithm-level trace record per forward whether it replayed.
+            try:
+                forward_batch.dllm_graph_replayed = True
+            except Exception:
+                pass
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:

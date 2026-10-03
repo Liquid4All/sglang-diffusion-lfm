@@ -41,6 +41,7 @@ dispatch. Metadata + cuda-graph capture/replay come from
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional
 
 import torch
@@ -48,10 +49,13 @@ import torch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+logger = logging.getLogger(__name__)
 
 
 class ShortConvMetadata(NamedTuple):
@@ -75,6 +79,9 @@ class ShortConvMetadata(NamedTuple):
     slot_ids_cpu: Optional[List[int]] = None
     # Host mirror of has_initial_state for extend host loops. None on decode.
     has_prefix_cpu: Optional[List[bool]] = None
+    # Host per-request query lengths for the varlen conv kernel, avoiding its
+    # D2H sync (a hard error under graph capture). None => kernel derives it.
+    seq_lens_cpu: Optional[List[int]] = None
 
 
 class ShortConvAttnBackend(MambaAttnBackendBase):
@@ -103,8 +110,10 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         # mirrors drive the extend loop; ``_cache_indices`` is the int64 slot
         # index view shared by all conv layers within the step.
         self._has_initial_state: Optional[torch.Tensor] = None
+        self._cg_has_initial_state: Optional[torch.Tensor] = None
         self._slot_ids_cpu: Optional[List[int]] = None
         self._has_prefix_cpu: Optional[List[bool]] = None
+        self._seq_lens_cpu: Optional[List[int]] = None
         self._cache_indices: Optional[torch.Tensor] = None
         self._cache_indices_buf: Optional[torch.Tensor] = None
 
@@ -112,6 +121,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         self._has_initial_state = None
         self._slot_ids_cpu = None
         self._has_prefix_cpu = None
+        self._seq_lens_cpu = None
 
     def _alloc_cache_indices_buf(self, max_bs: int):
         # Refilled in place per step so a captured graph reads a stable address.
@@ -127,6 +137,13 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         self._cache_indices_buf = torch.empty(
             max_bs, dtype=self.cache_indices_dtype, device=self.device
         )
+
+    def conv_state_pool(self) -> torch.Tensor:
+        """Whole conv-state pool [n_layers, n_slots, conv_dim, conv_kernel-1].
+
+        Per-layer caches are views of it, so one slot index reaches every layer.
+        """
+        return self.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
 
     def _refresh_cache_indices(self):
         # ONCE per step, shared by every conv layer. With a graph buffer, refill IN
@@ -147,10 +164,35 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
         self._alloc_cache_indices_buf(max_bs)
+        # Stable "resumes a cached prefix" mask for DLLM_EXTEND graphs, written
+        # in place since the captured kernel reads it by pointer.
+        if self._dllm_block_size is not None:
+            self._cg_has_initial_state = torch.zeros(
+                (max_bs,), dtype=torch.bool, device=self.device
+            )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cpu_graph_state(max_bs, max_num_tokens)
         self._alloc_cache_indices_buf(max_bs)
+
+    def on_after_cuda_graph_warmup(self):
+        """Zero every conv slot dirtied by capture dummy forwards; returns the count.
+
+        Capture runs once before serving, so wiping every slot is safe.
+        """
+        # clear_slots lives on HybridReqToTokenPool.mamba_pool, not the pool.
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None or not hasattr(mamba_pool, "clear_slots"):
+            raise RuntimeError(
+                "cannot clear capture-dirtied conv state: "
+                f"{type(self.req_to_token_pool).__name__} exposes no "
+                "mamba_pool.clear_slots. Fix the accessor rather than skipping "
+                "the wipe -- skipping it leaves the first real request reading "
+                "capture-time garbage in its conv slots."
+            )
+        n_slots = mamba_pool.mamba_cache.conv[0].shape[1]
+        mamba_pool.clear_slots(torch.arange(int(n_slots), device=self.device))
+        return int(n_slots)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Eager path (also the CPU-graph replay path). Builds
@@ -165,11 +207,40 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             and not mode.is_draft_extend_v2()
         ):
             self._has_initial_state = forward_batch.extend_prefix_lens > 0
+            if forward_batch.extend_seq_lens_cpu is not None:
+                # Saves a D2H sync per layer. Real lengths, not block_size:
+                # DLLM_EXTEND also covers the variable-length prompt prefill.
+                self._seq_lens_cpu = list(forward_batch.extend_seq_lens_cpu)
             if self.needs_extend_host_mirrors and self._cache_indices is not None:
                 self._slot_ids_cpu = self._cache_indices.tolist()
                 self._has_prefix_cpu = [
                     int(p) > 0 for p in forward_batch.extend_prefix_lens_cpu
                 ]
+
+    def _dllm_width(self, forward_batch) -> Optional[int]:
+        """Per-request query width of this dLLM forward, or None if not legal.
+
+        block_size, or 2*block_size for a commit-fusion window; derived from the
+        batch because the width varies within a request.
+        """
+        blk = getattr(self, "_dllm_block_size", None)
+        if blk is None:
+            return None
+        bs = int(forward_batch.batch_size)
+        n = int(forward_batch.input_ids.numel())
+        if bs <= 0 or n % bs:
+            return None
+        w = n // bs
+        # Validate against the config's width list (2*blk is illegal unfused).
+        legal = getattr(self, "_dllm_widths", None) or (blk,)
+        return w if w in tuple(int(x) for x in legal) else None
+
+    def _dllm_seq_lens_cpu(self, bs: int, width: Optional[int] = None):
+        if width is None:
+            width = getattr(self, "_dllm_block_size", None)
+        if width is None:
+            return None
+        return [int(width)] * int(bs)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
@@ -178,6 +249,34 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         super().init_forward_metadata_out_graph(forward_batch, in_capture)
         self._reset_step_state()
         self._refresh_cache_indices()
+        if forward_batch.forward_mode == ForwardMode.DLLM_EXTEND:
+            # Graph path: seq_lens_cpu must be supplied or the conv kernel's
+            # fallback D2H copy aborts the capture.
+            bs = forward_batch.batch_size
+            # Defence-in-depth: can_run_graph already refuses variable-length
+            # DLLM_EXTEND.
+            n = forward_batch.input_ids.numel()
+            _w = self._dllm_width(forward_batch)
+            if self._dllm_block_size is not None and _w is None:
+                raise ValueError(
+                    f"DLLM_EXTEND graph path got {n} tokens for batch {bs}; "
+                    f"expected bs * block_size ({bs * self._dllm_block_size}) "
+                    f"or bs * 2*block_size "
+                    f"({bs * 2 * self._dllm_block_size}) -- the fused window "
+                    "carries the previous block. A variable-length extend must "
+                    "not be graph-replayed."
+                )
+            self._seq_lens_cpu = self._dllm_seq_lens_cpu(bs, _w)
+            # extend_prefix_lens is None here; a request resumes a prefix iff
+            # seq_len > width (the actual width, not block_size, under fusion).
+            if self._cg_has_initial_state is not None:
+                mask = self._cg_has_initial_state[:bs]
+                torch.gt(
+                    forward_batch.seq_lens[:bs],
+                    _w if _w is not None else self._dllm_block_size,
+                    out=mask,
+                )
+                self._has_initial_state = mask
 
     def init_forward_metadata_capture_cpu_graph(self, *args, **kwargs):
         # Decode CPU-graph capture path. The base fills forward_metadata but not
@@ -213,6 +312,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             has_initial_state=self._has_initial_state,
             slot_ids_cpu=self._slot_ids_cpu,
             has_prefix_cpu=self._has_prefix_cpu,
+            seq_lens_cpu=self._seq_lens_cpu,
         )
 
     # The short-conv layers are invoked via conv_state_metadata + the model's own

@@ -31,6 +31,7 @@ from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.configs.lfm2 import Lfm2Config
+from sglang.srt.configs.lfm2_diffusion import Lfm2DiffusionConfig
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
 from sglang.srt.configs.locate_anything import LocateAnythingConfig
@@ -100,6 +101,7 @@ __all__ = [
     "FalconH1Config",
     "GraniteMoeHybridConfig",
     "Lfm2Config",
+    "Lfm2DiffusionConfig",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",
     "LocateAnythingConfig",

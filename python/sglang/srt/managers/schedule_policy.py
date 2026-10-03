@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.params import request_sampling_overrides
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import (
@@ -532,7 +533,7 @@ class PrefillAdder:
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
-            self._init_dllm_meta(dllm_config)
+            self._init_dllm_meta(dllm_config, max_running_requests)
 
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
@@ -645,11 +646,31 @@ class PrefillAdder:
 
         return AddReqResult.OTHER
 
-    def _init_dllm_meta(self, dllm_config: DllmConfig):
+    def _init_dllm_meta(
+        self,
+        dllm_config: DllmConfig,
+        max_running_requests: Optional[int] = None,
+    ):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
+        if max_running_reqs is None:
+            # Fall back to the scheduler's cap. Passed as an argument because
+            # self.max_running_requests is not yet assigned here.
+            max_running_reqs = max_running_requests or 1
+        # Commit fusion carries the previous block, so a generation window is
+        # 2*block_size; budgeting one block would defer the request forever.
+        acfg = getattr(dllm_config, "algorithm_config", None) or {}
+        self.dllm_window_size = self.dllm_block_size * (
+            2 if acfg.get("commit_fusion", False) else 1
+        )
 
-        self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+        # One generation window per running request.
+        self.rem_dllm_tokens = max_running_reqs * self.dllm_window_size
+        # Separate budget for the anchored prompt prefill (an ordinary extend),
+        # drawn from this pass's prefill-token allowance.
+        self.rem_dllm_prefill_tokens = max(
+            self.dllm_block_size, int(self.rem_input_tokens)
+        )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -912,28 +933,134 @@ class PrefillAdder:
             self.log_host_hit_tokens += host_hit
             self.log_storage_hit_tokens += storage_hit
 
-    def _get_dllm_remain_tokens(self) -> int:
+    def _get_dllm_remain_tokens(self, req: Optional[Req] = None) -> int:
+        # A fused window allocates only block_size fresh slots (the carried half
+        # is reused), so credit the full width or it livelocks; prefills get none.
+        _cap = int(self.rem_total_tokens)
+        if (
+            self.dllm_window_size > self.dllm_block_size
+            and req is not None
+            and not req.is_dllm_prefill()
+            and _cap >= self.dllm_block_size
+        ):
+            _cap = max(_cap, self.dllm_window_size)
         _rem_tokens = min(
             self.rem_dllm_tokens,
-            self.dllm_block_size,
-            int(self.rem_total_tokens),
+            # the window, not the block (a fused window is 2*block_size)
+            self.dllm_window_size,
+            _cap,
         )
         if _rem_tokens <= 0:
             _rem_tokens = self.rem_dllm_tokens
 
         return _rem_tokens
 
-    def _add_dllm_req(self, req: Req, prefix_len: int):
-        # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
-        # the diffusion unmask process may have some problems
-        # Make sure at least one page is available
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
+    def _dllm_batch_uniform(self, req: Req) -> Optional[str]:
+        """None if ``req`` can share a forward with the scheduled batch, else the
+        violated batch-uniform invariant; the algorithm asserts these in the forward.
+        """
+        if self.dllm_config is None:
+            return None
+        others = list(self.can_run_list)
+        if self.running_batch is not None:
+            others += list(self.running_batch.reqs)
+        nfe = req.sampling_params.dllm_steps_per_block
+        if not all(o.sampling_params.dllm_steps_per_block == nfe for o in others):
+            return "nfe"
+        # top_k == 1 is SGLang's canonical greedy encoding; see
+        # ForwardBatch.dllm_greedy for why temperature itself is not read here.
+        greedy = req.sampling_params.top_k == 1
+        if not all((o.sampling_params.top_k == 1) is greedy for o in others):
+            return "greedy"
+        # One block runs one sampler: temperature, top_p and top_k set by the
+        # request must match across the batch.
+        overrides = request_sampling_overrides(req.sampling_params)
+        if not all(
+            request_sampling_overrides(o.sampling_params) == overrides for o in others
+        ):
+            return "sampling"
+        # DuoBlock is lockstep: under FDFO, rows can share a forward only at
+        # the same point of the same block. Masked algorithms keep per-request
+        # state and may mix fresh and carried rows.
+        if getattr(self.dllm_config, "algorithm", None) == "DuoBlock":
+            key = self._dllm_state_key(req)
+            if not all(self._dllm_state_key(o) == key for o in others):
+                return "phase"
+        return None
+
+    @staticmethod
+    def _dllm_state_key(req: Req):
+        """Return None for a request starting a block, else its FDFO block
+        position; states without phase/step fields key as "carried" only."""
+        st = getattr(req, "dllm_algo_state", None)
+        if st is None:
+            return None
+        # The ctx identity separates cohorts that meet at the same (phase, step)
+        # but have different block scratch.
+        return (
+            getattr(st, "phase", None),
+            getattr(st, "i", None),
+            id(getattr(st, "ctx", None)),
         )
 
+    def _dllm_prefix_bidirectional(self) -> bool:
+        return bool(getattr(self.dllm_config, "prefix_bidirectional", False))
+
+    def _add_dllm_req(self, req: Req, prefix_len: int) -> bool:
+        if envs.SGLANG_DLLM_PREFIX_TRACE.get():
+            # A KV prefix reused without its matching conv checkpoint changes
+            # output on hybrid conv models.
+            _blk = getattr(self.dllm_config, "block_size", None)
+            logger.warning(
+                "dllm-prefix-trace: rid=%s prompt=%d prefix=%d "
+                "phase=%s block_aligned=%s mamba_slot=%s cow_src=%s "
+                "needs_clear=%s",
+                getattr(req, "rid", "?"),
+                len(req.origin_input_ids),
+                prefix_len,
+                getattr(req, "dllm_phase", None),
+                (prefix_len % _blk == 0) if _blk else None,
+                getattr(req, "mamba_pool_idx", None),
+                getattr(req, "mamba_cow_src_index", None),
+                getattr(req, "mamba_needs_clear", None),
+            )
+        if getattr(self.dllm_config, "anchored", False):
+            remaining = len(req.full_untruncated_fill_ids) - prefix_len
+            if prefix_len < len(req.origin_input_ids):
+                # Anchored prompt prefill: one extend if the budget allows;
+                # truncating a causal prefill is only a slowdown.
+                trunc_len = min(self.rem_dllm_prefill_tokens, remaining)
+                if self.rem_chunk_tokens is not None:
+                    trunc_len = min(trunc_len, self.rem_chunk_tokens)
+                if trunc_len <= 0:
+                    return False
+                if trunc_len < remaining and self._dllm_prefix_bidirectional():
+                    # Bidirectional prefix attention cannot be chunked; defer.
+                    return False
+            else:
+                # Anchored decode window is all-or-nothing (the algorithm needs
+                # exactly block_size rows); defer rather than truncate.
+                if self.rem_dllm_tokens < self.dllm_block_size:
+                    return False
+                trunc_len = self.dllm_block_size
+        else:
+            # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
+            # the diffusion unmask process may have some problems
+            # Make sure at least one page is available
+            trunc_len = (
+                min(self.rem_dllm_tokens, self.dllm_block_size)
+                // self.page_size
+                * self.page_size
+            )
+
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
+        if getattr(self.dllm_config, "anchored", False) and prefix_len < len(
+            req.origin_input_ids
+        ):
+            # prompt prefill draws on the prefill allowance
+            self.rem_dllm_prefill_tokens -= trunc_len
+            if self.rem_chunk_tokens is not None:
+                self.rem_chunk_tokens -= trunc_len
 
         self.can_run_list.append(req)
 
@@ -946,6 +1073,7 @@ class PrefillAdder:
             host_hit_len=req.host_hit_length,
             storage_hit_len=req.storage_hit_length,
         )
+        return True
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -957,7 +1085,7 @@ class PrefillAdder:
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
-        _rem_tokens = self._get_dllm_remain_tokens()
+        _rem_tokens = self._get_dllm_remain_tokens(req)
 
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
@@ -969,6 +1097,18 @@ class PrefillAdder:
         if req.dllm_incomplete_ids and cand_extend_input_len > _rem_tokens:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens
+        if (
+            truncated
+            and getattr(self.dllm_config, "anchored", False)
+            and len(req.prefix_indices) >= len(req.origin_input_ids)
+        ):
+            # anchored decode window is all-or-nothing; defer
+            return AddReqResult.NO_TOKEN
+        if truncated and self._dllm_prefix_bidirectional():
+            # bidirectional clean context cannot be chunked (see _add_dllm_req)
+            return AddReqResult.NO_TOKEN
+        if (_why := self._dllm_batch_uniform(req)) is not None:
+            return AddReqResult.OTHER
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
@@ -990,13 +1130,13 @@ class PrefillAdder:
         # Return based on remaining token availability
         return (
             AddReqResult.NO_TOKEN
-            if self._get_dllm_remain_tokens() <= 0
+            if self._get_dllm_remain_tokens(req) <= 0
             else AddReqResult.CONTINUE
         )
 
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
-            _rem_tokens = self._get_dllm_remain_tokens()
+            _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
@@ -1150,7 +1290,10 @@ class PrefillAdder:
             ) is not None:
                 return tile_stop
 
-            self._add_dllm_req(req, 0)
+            # Start after the matched prefix, as in the non-ignore-eos path.
+            if self._dllm_batch_uniform(req) is not None:
+                return AddReqResult.OTHER
+            self._add_dllm_req(req, len(req.prefix_indices))
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
@@ -1349,8 +1492,10 @@ class PrefillAdder:
                 ) is not None:
                     return tile_stop
 
-                self._add_dllm_req(req, prefix_len)
-                self._req_inc_lock_ref(req)
+                if self._dllm_batch_uniform(req) is not None:
+                    return AddReqResult.OTHER
+                if self._add_dllm_req(req, prefix_len):
+                    self._req_inc_lock_ref(req)
             elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
                 if (
                     tile_stop := self._check_prefill_tile_budget(input_tokens)

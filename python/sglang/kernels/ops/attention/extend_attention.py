@@ -317,6 +317,7 @@ def _fwd_kernel(
     mask_indptr,
     sink_ptr,
     window_kv_offset_ptr,
+    causal_rows_ptr,
     sm_scale,
     k_scale,
     v_scale,
@@ -353,7 +354,14 @@ def _fwd_kernel(
     BLOCK_N: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    # Per-request causality from causal_rows_ptr (one flag per request), so a
+    # batch can mix causal (dLLM commit) and bidirectional (denoise) rows.
+    PER_REQ_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
+    # dLLM commit fusion: window is [block k-1 final (causal) | block k noised
+    # (bidirectional)], i.e. mask[i][j] = (j <= i) if i < CLEAN_UPTO else True.
+    # Constexpr (block_size), so no mask buffer and CUDA-graph safe. 0 disables.
+    CLEAN_UPTO: tl.constexpr,
     STORE_LSE: tl.constexpr,
     SKIP_PREFIX: tl.constexpr,
     SKIP_EXTEND: tl.constexpr,
@@ -600,9 +608,11 @@ def _fwd_kernel(
 
     # stage 2: compute the triangle part
 
+    # PER_REQ_CAUSAL: use the bidirectional extent; the mask below drops the
+    # upper triangle for causal rows.
     cur_block_m_end = (
         cur_seq_len_extend
-        if not IS_CAUSAL
+        if (not IS_CAUSAL) or PER_REQ_CAUSAL
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
@@ -626,12 +636,32 @@ def _fwd_kernel(
             )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
+        elif PER_REQ_CAUSAL:
+            # A row is causal if its request is causal OR it is in the clean
+            # half. CLEAN_UPTO must be composed here since this branch shadows
+            # the CLEAN_UPTO branch below.
+            row_i = cur_block_m * BLOCK_M + offs_m[:, None]
+            col_j = start_n + offs_n[None, :]
+            row_causal = tl.load(causal_rows_ptr + cur_seq) != 0
+            if CLEAN_UPTO > 0:
+                row_causal = row_causal | (row_i < CLEAN_UPTO)
+            mask_causual = tl.where(row_causal, row_i >= col_j, True)
+            mask_causual &= mask_m[:, None] & mask_n[None, :]
+            final_mask &= mask_causual
         elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
                 start_n + offs_n[None, :]
             )
             mask_causual &= mask_m[:, None] & mask_n[None, :]
             final_mask &= mask_causual
+        elif CLEAN_UPTO > 0:
+            # Clean-half rows (i < CLEAN_UPTO) are causal, so they never see
+            # the noised half; the rest see the whole window.
+            row_i = cur_block_m * BLOCK_M + offs_m[:, None]
+            col_j = start_n + offs_n[None, :]
+            mask_fused = tl.where(row_i < CLEAN_UPTO, row_i >= col_j, True)
+            mask_fused &= mask_m[:, None] & mask_n[None, :]
+            final_mask &= mask_fused
         else:
             mask_non_causal = mask_m[:, None] & mask_n[None, :]
             final_mask &= mask_non_causal
@@ -644,7 +674,7 @@ def _fwd_kernel(
             final_mask &= window_mask
 
         SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0 or CLEAN_UPTO > 0:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -750,6 +780,14 @@ def _fwd_kernel(
         )
 
 
+# Tuning for the short bidirectional dLLM denoise extend. Pipelining only
+# reorders loads, so it is bitwise-neutral (H100: ~15-25% faster); a wider
+# BLOCK_N changes the reduction order and is not bitwise, so it stays default.
+# None = the launch's default.
+DLLM_SHORT_BLOCK_N = None
+DLLM_SHORT_NUM_STAGES = 3
+
+
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -769,6 +807,10 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
+    clean_upto=0,
+    # [batch] flags, nonzero = request attends causally. None keeps the
+    # batch-uniform `is_causal` path.
+    causal_rows=None,
     sliding_window_size=-1,
     sinks=None,
     window_kv_offsets=None,
@@ -780,6 +822,7 @@ def extend_attention_fwd(
     score_mod=None,
     aux_tensors=None,
     extend_seq_lens_cpu=None,
+    dllm_extend=False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -793,6 +836,14 @@ def extend_attention_fwd(
     ``score_mod`` / ``aux_tensors`` add a custom term to the attention logits;
     see triton_ops/score_mod.py for the contract.
     """
+    if causal_rows is not None and clean_upto > 0:
+        # The kernel composes the two masks, but no test combines per-request
+        # causality with commit fusion, so refuse the pair.
+        raise NotImplementedError(
+            "per-request causality (causal_rows) combined with commit fusion "
+            f"(clean_upto={clean_upto}) is untested; see _fwd_kernel's "
+            "PER_REQ_CAUSAL branch for the intended composition."
+        )
     Lq, Lk, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],
@@ -803,6 +854,25 @@ def extend_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    # Short bidirectional extends take a 16-row M tile (measured ~2x on H100);
+    # bitwise-identical since BLOCK_N is unchanged. Past 1024 rows the larger
+    # tile's reuse wins. Causal extends keep the default so the committed-block
+    # cache matches an AR prefill bit for bit.
+    _bs = qo_indptr.shape[0] - 1
+    _short_bound = 256 if (dllm_extend and _bs * max_len_extend <= 1024) else 64
+    if not is_causal and 0 < max_len_extend <= _short_bound and BLOCK_M > 16:
+        BLOCK_M = 16
+        if DLLM_SHORT_BLOCK_N is not None:
+            BLOCK_N = DLLM_SHORT_BLOCK_N
+        # Pipelining only on the validated tile (CUDA, d <= 128, BLOCK_N <= 64):
+        # BLOCK_N=128 archs would need ~3x the shared memory; gfx950 spills.
+        _short_stages = (
+            DLLM_SHORT_NUM_STAGES
+            if (not _is_hip and Lq <= 128 and BLOCK_N <= 64)
+            else None
+        )
+    else:
+        _short_stages = None
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
@@ -837,7 +907,7 @@ def extend_attention_fwd(
         grid = (compact_q_tiles, head_num)
     else:
         grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    num_stages = 1 if _short_stages is None else int(_short_stages)
 
     extra_kargs = {}
     if _is_hip:
@@ -869,6 +939,7 @@ def extend_attention_fwd(
         mask_indptr,
         sinks,
         window_kv_offsets,
+        causal_rows,
         sm_scale,
         k_scale,
         v_scale,
@@ -904,7 +975,9 @@ def extend_attention_fwd(
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
+        PER_REQ_CAUSAL=causal_rows is not None,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        CLEAN_UPTO=clean_upto,
         STORE_LSE=STORE_LSE,
         SKIP_PREFIX=skip_prefix,
         SKIP_EXTEND=skip_extend,
@@ -1002,6 +1075,10 @@ def _fwd_kernel_unified(
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
+    # dLLM commit fusion: window is [block k-1 final (causal) | block k noised
+    # (bidirectional)], i.e. mask[i][j] = (j <= i) if i < CLEAN_UPTO else True.
+    # Constexpr (block_size), so no mask buffer and CUDA-graph safe. 0 disables.
+    CLEAN_UPTO: tl.constexpr,
     HAS_SINK: tl.constexpr,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
@@ -1118,6 +1195,18 @@ def _fwd_kernel_unified(
             )
             final_mask &= causal_mask
 
+        if CLEAN_UPTO > 0 and not USE_CUSTOM_MASK:
+            # Same rule in extend-relative coordinates; prefix stays visible.
+            q_idx = cur_block_m * BLOCK_M + offs_m[:, None]
+            k_tot = start_n + offs_n[None, :]
+            k_ext = k_tot - cur_seq_prefix_len
+            fused_mask = tl.where(
+                k_tot >= cur_seq_prefix_len,
+                tl.where(q_idx < CLEAN_UPTO, q_idx >= k_ext, True),
+                True,
+            )
+            final_mask &= fused_mask
+
         if SLIDING_WINDOW_SIZE > 0:
             # Sliding window mask with correct absolute positions
             # Q absolute position: window_start + prefix_len + q_position_in_extend
@@ -1137,7 +1226,7 @@ def _fwd_kernel_unified(
 
         # Check if we can skip this tile
         SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0 or CLEAN_UPTO > 0:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -1285,6 +1374,7 @@ def extend_attention_fwd_unified(
     sm_scale=None,
     logit_cap=0.0,
     is_causal=True,
+    clean_upto=0,
     sliding_window_size=-1,
     sinks=None,
     window_start_pos=None,
@@ -1397,6 +1487,7 @@ def extend_attention_fwd_unified(
         Lv=Lv,
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        CLEAN_UPTO=clean_upto,
         HAS_SINK=HAS_SINK,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,

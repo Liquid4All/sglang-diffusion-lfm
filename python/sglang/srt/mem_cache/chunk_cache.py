@@ -86,10 +86,25 @@ class ChunkCache(BasePrefixCache):
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
+    # Inherited by SWAChunkCache / PureSWAChunkCache along with
+    # cache_unfinished_req.
+    supports_dllm_prefix_holdback = True
+
     def cache_unfinished_req(self, req: Req, chunked=False):
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.extend_range.end
-        ]
+        # dLLM decode rounds skip prefix matching, so the prefix set here is
+        # what the next round sees. Commit fusion holds it back one block so
+        # block k-1 is re-extended and its clean KV written.
+        end = req.extend_range.end
+        hold = 0
+        if getattr(req, "dllm_config", None) is not None:
+            hold = req.dllm_prefix_holdback()
+            # Only once the whole prompt is prefilled: mid-chunked-prefill, the
+            # max() floor below would advance the prefix over unallocated
+            # (zero-initialized) req_to_token entries.
+            if hold and end >= len(req.origin_input_ids):
+                # Never hold back into the prompt, which would re-prefill it.
+                end = max(len(req.origin_input_ids), end - hold)
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :end]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 

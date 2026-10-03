@@ -29,11 +29,17 @@ def import_algorithms():
 
 
 def get_algorithm(config: DllmConfig):
+    # Only an unknown name is an unknown-algorithm error; constructor failures
+    # (e.g. DllmContractError) must propagate unrelabelled.
+    name = config.algorithm
     try:
-        name = config.algorithm
-        return algo_name_to_cls[name](config)
-    except:
-        raise RuntimeError(f"Unknown diffusion LLM algorithm: {name}")
+        cls = algo_name_to_cls[name]
+    except KeyError:
+        known = ", ".join(sorted(algo_name_to_cls)) or "<none imported>"
+        raise RuntimeError(
+            f"Unknown diffusion LLM algorithm: {name}. Known: {known}"
+        ) from None
+    return cls(config)
 
 
 algo_name_to_cls = import_algorithms()

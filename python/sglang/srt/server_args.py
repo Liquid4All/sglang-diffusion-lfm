@@ -3070,14 +3070,69 @@ class ServerArgs:
         "The diffusion LLM algorithm configurations. Must be a YAML file.",
         NS("exec.dllm"),
     ] = None
-    dllm_fdfo: A[
+    dllm_prefix_attention: A[
+        str,
+        Arg(
+            help=(
+                "How CLEAN context (the prompt prefill and every committed "
+                "block) is encoded into the KV cache for block-diffusion "
+                "models. 'causal' (default) encodes it token-causally, "
+                "exactly like the AR model -- the trained clean-stream "
+                "contract for token-causal-prefix (tcp) checkpoints. "
+                "'bidirectional' encodes clean context with full attention "
+                "inside the prefill segment and inside each committed block; "
+                "use it only for checkpoints trained that way, otherwise the "
+                "KV the generation blocks attend is off-contract."
+            ),
+            choices=["causal", "bidirectional"],
+        ),
+        NS("exec.dllm"),
+    ] = "causal"
+    dllm_cuda_graph: A[
         bool,
         Arg(
-            help="Enable First-Done-First-Out (FDFO) scheduling for diffusion LLM inference. Enabled by default; use --no-dllm-fdfo to fall back to synchronous block scheduling.",
+            help=(
+                "Capture the per-forward block-diffusion passes as CUDA/HIP "
+                "graphs (DECODE phase only; the anchored prompt prefill is "
+                "variable-length and stays eager). Graphs are keyed on the "
+                "conditioning variant -- attention causality and "
+                "self-conditioning presence are BAKED at capture. A block's "
+                "FIRST forward is no longer forced eager: where the graph "
+                "runner can record the short-conv snapshot itself, just "
+                "before the replay, that forward carries no unrecordable side "
+                "effect and becomes eligible like any other (it still falls "
+                "back to eager where the runner cannot, and "
+                "SGLANG_DLLM_ENABLE_GRAPH_FIRST_FORWARD=0 forces it eager "
+                "everywhere). Off by default until the parity gates are green "
+                "with graphs on."
+            ),
             action=argparse.BooleanOptionalAction,
         ),
         NS("exec.dllm"),
-    ] = True
+    ] = False
+    dllm_experimental_prefix_cache: A[
+        bool,
+        Arg(
+            help=(
+                "UNVALIDATED. Allow radix prefix caching for DuoBlock block "
+                "diffusion. Measured on the v4 fixture: enabling it changes "
+                "generated tokens on 21 of 48 parity cells, so a shared prefix "
+                "is NOT yet reproducing the cold-prefill result -- suspected "
+                "short-conv state reuse across a radix match. Off by default; "
+                "the flag exists to continue that investigation, not to serve."
+            ),
+            action=argparse.BooleanOptionalAction,
+        ),
+        NS("exec.dllm"),
+    ] = False
+    dllm_fdfo: A[
+        Optional[bool],
+        Arg(
+            help="First-Done-First-Out (FDFO) scheduling for diffusion LLM inference: one forward per scheduler round with per-request state carried between rounds, so requests can be admitted and retired between steps. Unset -> the algorithm's default: on for the masked algorithms, OFF for DuoBlock, whose ~1 ms forward makes the per-round scheduler cost dominant (2.5x wall at bs=1 under graphs; see SGLANG_DLLM_FDFO_STEPS_PER_CALL). --dllm-fdfo / --no-dllm-fdfo override.",
+            action=argparse.BooleanOptionalAction,
+        ),
+        NS("exec.dllm"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # PD disaggregation
@@ -8428,10 +8483,106 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
+        if self.dllm_algorithm == "DuoBlock":
+            # DuoBlock envelope: triton attention only (the one backend validated
+            # for its masks), decode graphs opt-in, prefill graphs off.
+            if self.attention_backend is None:
+                self.attention_backend = "triton"
+            # One of three triton guards (with _dllm_attention_backend and
+            # DuoBlock._assert_causality_aware_backend) sharing this debug flag.
+            _diag = envs.SGLANG_DLLM_DEBUG_ALLOW_NONTRITON_ATTENTION.get()
+            if _diag:
+                logger.warning(
+                    "SGLANG_DLLM_DEBUG_ALLOW_NONTRITON_ATTENTION is set: the "
+                    "DuoBlock triton-backend guards are LIFTED. This is a "
+                    "correctness-A/B hook, not a serving mode -- a non-triton "
+                    "backend may denoise causally and produce off-contract "
+                    "tokens."
+                )
+            assert _diag or self.attention_backend == "triton", (
+                f"--dllm-algorithm DuoBlock requires --attention-backend triton "
+                f"(got {self.attention_backend}): other backends ignore the "
+                "per-forward causality override and would denoise causally."
+                # fa3's eager DLLM_EXTEND path is unvalidated and its cuda-graph
+                # path raises on DLLM_EXTEND at capture.
+            )
+            # Split overrides take priority over --attention-backend.
+            for _split in ("prefill_attention_backend", "decode_attention_backend"):
+                _v = getattr(self, _split, None)
+                assert _diag or _v in (None, "triton"), (
+                    f"--dllm-algorithm DuoBlock requires --{_split.replace('_', '-')} "
+                    f"to be unset or 'triton' (got {_v})."
+                )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--dllm-algorithm DuoBlock cannot be combined with "
+                    f"--speculative-algorithm {self.speculative_algorithm}: the "
+                    "dLLM scheduler path never runs speculative decoding."
+                )
+            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                logger.warning(
+                    "Prefill cuda graph is disabled for DuoBlock diffusion "
+                    "inference (the anchored prompt prefill is one "
+                    "variable-length segment)"
+                )
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            if (
+                not self.dllm_cuda_graph
+                and self.cuda_graph_config.decode.backend != Backend.DISABLED
+            ):
+                logger.warning(
+                    "Decode cuda graph is disabled for DuoBlock diffusion "
+                    "inference; pass --dllm-cuda-graph to enable it"
+                )
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+            if self.dllm_prefix_attention == "bidirectional":
+                # Bidirectional prefix attention requires a one-segment prompt
+                # prefill; chunking would produce off-contract KV.
+                if self.chunked_prefill_size is not None and (
+                    self.chunked_prefill_size > 0
+                ):
+                    logger.warning(
+                        "Disabling chunked prefill: --dllm-prefix-attention "
+                        "bidirectional requires the prompt in one segment."
+                    )
+                    self.chunked_prefill_size = -1
+            if (
+                not self.disable_radix_cache
+                and self.dllm_prefix_attention == "bidirectional"
+            ):
+                logger.warning(
+                    "Radix cache is disabled: --dllm-prefix-attention "
+                    "bidirectional makes prompt KV depend on the whole prompt, "
+                    "so a shared prefix does not have shared KV."
+                )
+                self.disable_radix_cache = True
+            if not self.disable_radix_cache and not (
+                self.dllm_experimental_prefix_cache
+            ):
+                # Shared-prefix KV differs across prefill lengths by bf16 noise,
+                # which flips greedy tokens; off until shown quality-neutral.
+                logger.warning(
+                    "Radix cache is disabled for DuoBlock diffusion inference "
+                    "(shared-prefix KV differs by bf16 noise across prefill "
+                    "lengths and this model flips tokens on it; re-enable with "
+                    "--dllm-experimental-prefix-cache)"
+                )
+                self.disable_radix_cache = True
+            if not self.disable_radix_cache:
+                # Prefix caching needs an anchored grid: absolute grids need
+                # page_size == block_size, but the hybrid conv cache needs 1.
+                from sglang.srt.dllm.config import DllmConfig
+
+                assert getattr(DllmConfig.from_server_args(self), "anchored", False), (
+                    "dLLM prefix caching requires an anchored block grid; "
+                    "pass --disable-radix-cache for absolute-grid models."
+                )
         # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
         # resolution moved to the pipeline: arg_groups/overrides.py
         # _dllm_attention_backend, invoked below at its legacy slot).
-        if is_hip():
+        if is_hip() and not (
+            self.dllm_algorithm == "DuoBlock" and self.dllm_cuda_graph
+        ):
             if (
                 self.cuda_graph_config.decode.backend != Backend.DISABLED
                 or self.cuda_graph_config.prefill.backend != Backend.DISABLED

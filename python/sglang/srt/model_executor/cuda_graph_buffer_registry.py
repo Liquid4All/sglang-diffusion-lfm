@@ -143,6 +143,9 @@ class GraphSlot:
         pad_value      — sentinel for ``FILL_SENTINEL``.
         enabled        — runtime gate; disabled slots are not allocated
                          and skipped during fill / extract.
+        adopt_from_source -- when ``True`` (default), a registry built with a
+                         ``source`` adopts its same-named tensor; ``False``
+                         for registry-owned slots.
         copy_from_fb   — when ``True`` (default), ``fill_from`` copies the
                          same-named FB tensor into the buffer head. Set
                          ``False`` for computed slots whose value is not a
@@ -178,6 +181,7 @@ class GraphSlot:
     pad_value: Optional[Any] = None
     enabled: bool = True
     copy_from_fb: bool = True
+    adopt_from_source: bool = True
     post_fill: Optional[Callable[[torch.Tensor, ForwardBatch, FillContext], None]] = (
         None
     )
@@ -525,6 +529,12 @@ def build_decode_registry(
     dp_size: int = 1,
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
+    dllm_conditioning: bool = False,
+    dllm_selfcond_dim: int = 0,
+    dllm_adaln_dim: int = 0,
+    dllm_adaln_dtype: torch.dtype = torch.bfloat16,
+    dllm_tensor_causality: bool = False,
+    dllm_conv_state_at: bool = False,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
@@ -538,6 +548,13 @@ def build_decode_registry(
         triggers an illegal memory access (issue #24361).
       - ``input_ids`` -> FOREACH_COPY: head ``[:raw_n]`` is overwritten by the
         copy and the padded tail is not read.
+
+    ``dllm_conditioning`` registers the block-diffusion per-forward inputs as
+    FILL_SENTINEL, not ``ZERO`` (index-semantic only) or ``FILL_ONCE`` (a larger
+    replay would leave live values in a smaller batch's padded tail).
+
+    A ``None`` ``dllm_selfcond`` is not a zero tensor (a zero input still adds
+    an FFN bias), so its presence is part of the graph key.
 
     ``custom_mask`` / ``next_token_logits_buffer`` / ``input_embeds`` are not
     registered here — they are not per-replay FB copies (allocated and written
@@ -561,8 +578,82 @@ def build_decode_registry(
     def _bs(bs: int, _mt: int) -> Tuple[int, ...]:
         return (bs,)
 
+    def _tokens_hidden(_bs: int, mt: int) -> Tuple[int, ...]:
+        return (mt, dllm_selfcond_dim)
+
+    def _tokens_adaln(_bs: int, mt: int) -> Tuple[int, ...]:
+        return (mt, dllm_adaln_dim)
+
     slots = [
         GraphSlot("input_ids", _tokens, torch.int64, axis="tokens"),
+        GraphSlot(
+            "dllm_sigma",
+            _tokens,
+            torch.float32,
+            axis="tokens",
+            padding_policy=PaddingPolicy.FILL_SENTINEL,
+            pad_value=0.0,
+            enabled=dllm_conditioning,
+            adopt_from_source=False,
+        ),
+        GraphSlot(
+            "dllm_selfcond",
+            _tokens_hidden,
+            torch.float32,
+            axis="tokens",
+            padding_policy=PaddingPolicy.FILL_SENTINEL,
+            pad_value=0.0,
+            enabled=dllm_conditioning and dllm_selfcond_dim > 0,
+            adopt_from_source=False,
+        ),
+        # Pre-selected adaLN base rows; padding 0.0 conditions as identity. A
+        # graph forward without the field is refused to eager by the runner.
+        GraphSlot(
+            "dllm_adaln_base",
+            _tokens_adaln,
+            dllm_adaln_dtype,
+            axis="tokens",
+            padding_policy=PaddingPolicy.FILL_SENTINEL,
+            pad_value=0.0,
+            enabled=dllm_conditioning and dllm_adaln_dim > 0,
+            adopt_from_source=False,
+        ),
+        GraphSlot(
+            # Self-conditioning gate: a slot because the model reads it behind a
+            # Python `if`. Padding 1.0 matches the ungated default.
+            "dllm_selfcond_pos_mask",
+            _tokens,
+            torch.float32,
+            axis="tokens",
+            padding_policy=PaddingPolicy.FILL_SENTINEL,
+            pad_value=1.0,
+            enabled=dllm_conditioning,
+            adopt_from_source=False,
+        ),
+        GraphSlot(
+            # Per-request causality: a slot because PER_REQ_CAUSAL is a constexpr
+            # resolved at capture. Padded rows are 0 (bidirectional), discarded.
+            "dllm_causal_rows",
+            _bs,
+            torch.int32,
+            axis="bs",
+            padding_policy=PaddingPolicy.FILL_SENTINEL,
+            pad_value=0,
+            enabled=dllm_tensor_causality,
+            adopt_from_source=False,
+        ),
+        GraphSlot(
+            # Per-request conv state point: a slot because STATE_AT is a constexpr
+            # resolved at capture. Padding 0 leaves the state alone.
+            "dllm_conv_state_at",
+            _bs,
+            torch.int32,
+            axis="bs",
+            padding_policy=PaddingPolicy.FILL_SENTINEL,
+            pad_value=0,
+            enabled=dllm_conv_state_at,
+            adopt_from_source=False,
+        ),
         GraphSlot(
             "positions",
             _tokens,
@@ -699,7 +790,7 @@ def build_decode_registry(
 
     for slot in slots:
         bind = None
-        if source is not None:
+        if source is not None and slot.adopt_from_source:
             bind = getattr(source, slot.name, None)
             if bind is None:
                 raise ValueError(
@@ -930,7 +1021,7 @@ def build_prefill_registry(
 
     for slot in slots:
         bind = None
-        if source is not None:
+        if source is not None and slot.adopt_from_source:
             bind = getattr(source, slot.name, None)
             if bind is None:
                 raise ValueError(

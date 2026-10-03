@@ -10,6 +10,7 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
@@ -209,6 +210,19 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
+    if envs.SGLANG_DLLM_PREFIX_TRACE.get():
+        # Separates "nothing inserted" from "key mismatch" on zero prefix hits.
+        logger.warning(
+            "dllm-insert-trace: rid=%s is_dllm=%s kv_committed=%d "
+            "prompt=%d outputs=%d is_insert=%s skip=%s",
+            getattr(req, "rid", "?"),
+            bool(getattr(req, "is_dllm", lambda: False)()),
+            effective_kv_committed_len,
+            len(getattr(req, "origin_input_ids", ()) or ()),
+            len(getattr(req, "output_ids", ()) or ()),
+            is_insert,
+            getattr(req, "skip_radix_cache_insert", False),
+        )
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),

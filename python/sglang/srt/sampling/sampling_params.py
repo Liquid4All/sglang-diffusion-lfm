@@ -88,6 +88,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     stop_regex_max_len: int = 0  # set by normalize()
     is_normalized: bool = False  # set by normalize()
 
+    # dLLM denoising steps per block; None uses the algorithm-config default.
+    # All requests in a dLLM batch must agree (asserted by the algorithm).
+    dllm_steps_per_block: Optional[int] = None
+
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
         # (e.g. /generate) can pass null without crashing verify().
@@ -149,6 +153,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        if self.dllm_steps_per_block is not None and self.dllm_steps_per_block < 1:
+            raise ValueError(
+                "dllm_steps_per_block must be at least 1, got "
+                f"{self.dllm_steps_per_block}."
+            )
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."

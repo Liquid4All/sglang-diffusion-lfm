@@ -559,6 +559,8 @@ class FlashAttentionBackend(AttentionBackend):
                 # max(num_accept_tokens_cpu) which is None/empty at capture time,
                 # falling back to 1. Restore the correct upper bound so the kernel
                 # sees num_tokens_per_req (not 1) for all replays of this graph.
+                # DLLM_EXTEND would need the same restoration but is rejected
+                # earlier by _apply_cuda_graph_metadata and the replay branch.
                 self.forward_metadata.max_seq_len_q = num_tokens // bs
         else:
             # A stale non-None seq_lens_cpu buffer would under-size max_seq_pages
@@ -966,9 +968,14 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
-            include_draft_extend_v2=True
+        elif (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
+            or forward_batch.forward_mode.is_dllm_extend()
         ):
+            # DLLM_EXTEND uses plain-extend metadata (CPU mirrors required); the
+            # graph path is refused elsewhere. Local attention / SWA untested.
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = eager_max_k
             metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -1268,6 +1275,25 @@ class FlashAttentionBackend(AttentionBackend):
             or layer.attn_type
             in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
         )
+        # dLLM per-forward causality; otherwise the layer's static attn_type
+        # would make every denoise forward causal.
+        _dllm_causal = forward_batch.dllm_causal_override
+        if _dllm_causal is not None:
+            if forward_batch.dllm_clean_upto:
+                # Commit fusion needs a per-row mask; FA takes one causal bool.
+                raise NotImplementedError(
+                    "FlashAttention cannot express the dLLM commit-fusion mask "
+                    f"(dllm_clean_upto={forward_batch.dllm_clean_upto}); it "
+                    "takes one causal flag per call, not a per-row mask. Use "
+                    "--attention-backend triton for fused windows."
+                )
+            if forward_batch.dllm_causal_rows is not None:
+                # Per-request causality is a tensor; FA takes a scalar.
+                raise NotImplementedError(
+                    "FlashAttention cannot express per-request dLLM causality "
+                    "(dllm_causal_rows); use --attention-backend triton."
+                )
+            causal = bool(_dllm_causal)
         # FlashAttention's sliding-window tuple is (left, right). Bidirectional
         # encoder layers must see the same local context on both sides.
         window_size = (

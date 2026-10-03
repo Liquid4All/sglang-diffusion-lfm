@@ -234,6 +234,11 @@ def zero_match_result(
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
 
+    # Whether this backend holds the dLLM prefix back one block, as commit
+    # fusion requires. Declared per implementation because server args
+    # cannot reliably tell which cache class gets built.
+    supports_dllm_prefix_holdback: bool = False
+
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
     )
